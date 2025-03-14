@@ -227,6 +227,11 @@ class SPECFile(BinaryFile):
             buffer_indx = spiffile.instgrps[inst_group]['core']['buffer_index'][:]
             try:
                 tas = spiffile.instgrps[inst_group]['core']['tas'][:]
+
+                # Fill NaN using numpy's interp, Yongjie Huang, 2024-08-17.
+                mask = numpy.isnan(tas)
+                tas[mask] = numpy.interp(numpy.flatnonzero(mask), numpy.flatnonzero(~mask), tas[~mask])
+
             except IndexError:
                 continue
             counts = spiffile.instgrps[inst_group]['core']['clock_counts'][:]
