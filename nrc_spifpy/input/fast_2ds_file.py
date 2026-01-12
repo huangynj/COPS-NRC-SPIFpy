@@ -14,15 +14,46 @@ import gc
 
 class Fast2DSFile(BinaryFile):
     """
-    Class representing "Fast 2DS" (Type 48) probe data.
-    Based on SPEC_OAP_Data_File_Formats_July_2022_Rev_D.
+    Class for reading and processing SPEC Fast 2D-S (Type 48) probe data.
     
-    Key Characteristics:
-    - Type 48 Format
-    - 48-bit timing words (encoded as 3 x 16-bit words at end of particle)
-    - External Housekeeping file (.2DSHK)
-    - Mixed Compressed (RLE) and Uncompressed data
+    Reference: SPEC_OAP_Data_File_Formats_July_2022_Rev_D
+    
+    File Structure:
+        - Base file (.F2DS): Contains image packets (2S) and NULL packets (NL)
+        - HK file (.F2DSHK): Contains housekeeping (HK) and mask (MK) packets
+    
+    Data Block Format (4114 bytes):
+        - Timestamp: 16 bytes (8 x uint16: year, month, dow, day, hour, min, sec, ms)
+        - Raw Data: 4096 bytes (2048 x uint16 words containing packets)
+        - Checksum: 2 bytes (discarded)
+    
+    Image Packet Format:
+        - Word 1: Header "2S" (0x3253 = 12883 decimal)
+        - Word 2: NHraw (bits 11-0: word count, bit 12: multi-packet, bit 15: overflow)
+        - Word 3: NVraw (same format as NHraw)
+        - Word 4: Particle ID (16-bit counter)
+        - Word 5: Slice count (number of 128-pixel slices)
+        - Words 6 to 5+N-3: Compressed/uncompressed image data
+        - Words 5+N-2 to 5+N: 48-bit timing (only if bit 12 = 0)
+    
+    Image Data Encoding:
+        - 0x4000: Fully shaded slice (128 shaded pixels)
+        - 0x7FFF: Next 8 words are uncompressed (8 x 16 bits = 128 pixels)
+        - Otherwise: RLE word (bit 14: start slice, bits 13-7: shaded, bits 6-0: clear)
+    
+    Attributes:
+        diodes (int): Number of diodes (128 for 2D-S)
+        aux_channels (list): Auxiliary data channels from HK file
     """
+    
+    # -------------------------------------------------------------------------
+    # Format Constants
+    # -------------------------------------------------------------------------
+    SYNC_2S = 12883           # 0x3253: Image packet header
+    SYNC_NL = 0x4C4E          # NULL packet header
+    RLE_FULL_SHADED = 0x4000  # Fully shaded slice (128 pixels)
+    RLE_UNCOMPRESSED = 0x7FFF # Next 8 words are raw bitmap
+    CLOCK_TICK_NS = 50        # 48-bit clock resolution: 50 ns (20 MHz)
 
     # =========================================================================
     # Phase 1: Initialization
@@ -30,22 +61,23 @@ class Fast2DSFile(BinaryFile):
 
     def __init__(self, filename, inst_name, resolution):
         super().__init__(filename, inst_name, resolution)
-        self.diodes = 128
+        self.diodes = 128  # 2D-S has 128 photodiodes
         
-        # Fast-2DS Base file contains only Images and NULLs (2S and NL)
-        self.file_dtype = numpy.dtype([('year', 'u2'),
-                                       ('month', 'u2'),
-                                       ('weekday', 'u2'),
-                                       ('day', 'u2'),
-                                       ('hour', 'u2'),
-                                       ('minute', 'u2'),
-                                       ('second', 'u2'),
-                                       ('ms', 'u2'),
-                                       ('data', '(2048, )u2'),
-                                       ('discard', 'u2')
-                                       ])
-                                       
-        # Aux channels come from external HK file
+        # Data block dtype: 4114 bytes = 16 (timestamp) + 4096 (data) + 2 (checksum)
+        self.file_dtype = numpy.dtype([
+            ('year', 'u2'),      # Timestamp word 1
+            ('month', 'u2'),     # Timestamp word 2
+            ('weekday', 'u2'),   # Timestamp word 3 (0=Sun, 6=Sat)
+            ('day', 'u2'),       # Timestamp word 4
+            ('hour', 'u2'),      # Timestamp word 5
+            ('minute', 'u2'),    # Timestamp word 6
+            ('second', 'u2'),    # Timestamp word 7
+            ('ms', 'u2'),        # Timestamp word 8 (milliseconds)
+            ('data', '(2048,)u2'),  # Raw data frame (4096 bytes)
+            ('discard', 'u2')    # Checksum (not used)
+        ])
+        
+        # Auxiliary channels interpolated from external HK file
         self.aux_channels = ['tas', 'user_temp', 'ps_temp']
 
     # =========================================================================
@@ -365,41 +397,39 @@ class Fast2DSFile(BinaryFile):
         while idx < limit:
             word = record[idx]
             
-            # Check for '2S' Sync (0x3253 = 12883)
-            if word == 12883:
-                # Need header at minimum
+            # Check for '2S' image packet sync word (0x3253 = 12883)
+            if word == self.SYNC_2S:
+                # Parse 5-word header: [2S, NHraw, NVraw, PID, Slices]
                 if idx + 5 <= limit:
-                    nh_raw = record[idx+1]
-                    nv_raw = record[idx+2]
-                    pid = record[idx+3]
-                    slices = record[idx+4]
+                    nh_raw = record[idx+1]  # Horizontal word count + flags
+                    nv_raw = record[idx+2]  # Vertical word count + flags
+                    pid = record[idx+3]      # Particle ID
+                    slices = record[idx+4]   # Expected slice count
                 else:
-                    # Header spans to next frame
-                    if not next_record_exists: break
-                    rem_len = limit - idx
-                    # Stitch generic header from current end and next start
-                    temp_header = []
-                    # Current part
-                    temp_header.extend(record[idx:])
-                    # Next part
+                    # Header spans frame boundary - stitch from both frames
+                    if not next_record_exists: 
+                        break
+                    temp_header = list(record[idx:])  # Current frame portion
                     needed = 5 - len(temp_header)
-                    temp_header.extend(record_next[:needed])
+                    temp_header.extend(record_next[:needed])  # Next frame portion
                     
                     nh_raw = temp_header[1]
                     nv_raw = temp_header[2]
                     pid = temp_header[3]
                     slices = temp_header[4]
                 
-                nh = nh_raw & 4095
-                nv = nv_raw & 4095
-                n_words = nh if nh > 0 else nv
+                # Extract word count from bits 11-0 (mask 0x0FFF = 4095)
+                nh = nh_raw & 0x0FFF
+                nv = nv_raw & 0x0FFF
+                n_words = nh if nh > 0 else nv  # One of NH/NV is always 0
                 
-                if n_words == 0: 
+                if n_words == 0:
                     idx += 1
                     continue
                 
                 is_horiz = (nh > 0)
-                is_multi_packet = ((nh_raw if is_horiz else nv_raw) & 4096) >> 12
+                # Bit 12 (0x1000): multi-packet flag (1 = more packets follow, no timing words)
+                is_multi_packet = ((nh_raw if is_horiz else nv_raw) & 0x1000) >> 12
                 
                 data_start = idx + 5
                 data_end = data_start + n_words
@@ -450,44 +480,60 @@ class Fast2DSFile(BinaryFile):
                     timing = 0  # Shouldn't happen but handle gracefully
                     payload_data = full_packet_data
                 
+                # Decode image data (RLE compressed or raw bitmap)
                 for val in payload_data:
+                    val = int(val)
+                    
                     if state['non_compressed'] > 0:
+                        # Raw bitmap mode: convert 16-bit word to 16 pixels
+                        # Pixel format: 1=clear, 0=shaded (inverted at final output)
                         bin_line = [-1 * (int(n) - 1) for n in bin(val)[2:].zfill(16)[::-1]]
                         state['slice_decomp'].extend(bin_line)
                         state['non_compressed'] -= 1
                         if state['non_compressed'] == 0 and len(state['slice_decomp']) > 0:
-                             if len(state['slice_decomp']) % 128 > 0:
-                                 state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
-                             state['img_decomp'].extend(state['slice_decomp'])
-                             state['slice_decomp'] = []
-                    elif val == 0x7FFF:
-                         if len(state['slice_decomp']) > 0:
-                             if len(state['slice_decomp']) % 128 > 0:
-                                 state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
-                             state['img_decomp'].extend(state['slice_decomp'])
-                             state['slice_decomp'] = []
-                         state['non_compressed'] = 8
-                    elif val == 0x4000:
-                         if len(state['slice_decomp']) > 0:
-                             if len(state['slice_decomp']) % 128 > 0:
-                                 state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
-                             state['img_decomp'].extend(state['slice_decomp'])
-                             state['slice_decomp'] = []
-                         state['img_decomp'].extend([1] * 128)
-                    else:
-                        timeslice = (val & (2 ** 15)) >> 15
-                        startslice = (val & (2 ** 14)) >> 14
-                        num_shaded = (val & 16256) >> 7
-                        num_clear = (val & 127)
+                            # Pad slice to 128 pixels and finalize
+                            if len(state['slice_decomp']) % 128 > 0:
+                                state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
+                            state['img_decomp'].extend(state['slice_decomp'])
+                            state['slice_decomp'] = []
+                            
+                    elif val == self.RLE_UNCOMPRESSED:  # 0x7FFF
+                        # Start of uncompressed slice: next 8 words are raw 128-bit bitmap
+                        if len(state['slice_decomp']) > 0:
+                            if len(state['slice_decomp']) % 128 > 0:
+                                state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
+                            state['img_decomp'].extend(state['slice_decomp'])
+                            state['slice_decomp'] = []
+                        state['non_compressed'] = 8  # Next 8 words are raw bitmap
                         
-                        if timeslice == 0:
-                            if startslice == 1 and len(state['slice_decomp']) > 0:
-                                if len(state['slice_decomp']) % 128 > 0:
-                                    state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
-                                state['img_decomp'].extend(state['slice_decomp'])
-                                state['slice_decomp'] = []
-                            state['slice_decomp'].extend([0] * num_clear)
-                            state['slice_decomp'].extend([1] * num_shaded)
+                    elif val == self.RLE_FULL_SHADED:  # 0x4000
+                        # Fully shaded slice: 128 shaded pixels
+                        if len(state['slice_decomp']) > 0:
+                            if len(state['slice_decomp']) % 128 > 0:
+                                state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
+                            state['img_decomp'].extend(state['slice_decomp'])
+                            state['slice_decomp'] = []
+                        state['img_decomp'].extend([1] * 128)  # All shaded
+                        
+                    else:
+                        # RLE encoded word:
+                        #   bit 15: always 0 for RLE
+                        #   bit 14: start of new slice (1 = first word of slice)
+                        #   bits 13-7: number of shaded pixels (0-127)
+                        #   bits 6-0: number of clear pixels (0-127)
+                        startslice = (val >> 14) & 1
+                        num_shaded = (val >> 7) & 0x7F   # bits 13-7
+                        num_clear = val & 0x7F           # bits 6-0
+                        
+                        if startslice == 1 and len(state['slice_decomp']) > 0:
+                            # Start of new slice - finalize previous
+                            if len(state['slice_decomp']) % 128 > 0:
+                                state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
+                            state['img_decomp'].extend(state['slice_decomp'])
+                            state['slice_decomp'] = []
+                        # Append clear pixels then shaded pixels
+                        state['slice_decomp'].extend([0] * num_clear)
+                        state['slice_decomp'].extend([1] * num_shaded)
                 
 
                 # Finalize Image
@@ -512,9 +558,10 @@ class Fast2DSFile(BinaryFile):
                 else:
                      idx = data_end
             
-            elif word == 0x4C4E:
+            elif word == self.SYNC_NL:  # 0x4C4E: NULL packet (FIFO flush/padding)
                 idx += 1
             else:
+                # Unknown word - skip
                 idx += 1
                 
         return {'h': h_images, 'v': v_images, 'next_idx': next_start_idx}
@@ -560,13 +607,11 @@ class Fast2DSFile(BinaryFile):
                     buf_idx = img_dict.get('buffer_index', 0)
                     timing = img_dict.get('time', 0)
                     
-                    # Calculate precise time
-                    # T_particle = T_buffer + (Clock_particle - Clock_min) * 50ns
+                    # Calculate precise particle time from 48-bit clock
+                    # Formula: T_particle = T_buffer + (Clock_particle - Clock_min) * CLOCK_TICK_NS
                     base_clock = buffer_baselines.get(buf_idx, timing)
-                    delta_clock = timing - base_clock
-                    if delta_clock < 0: delta_clock = 0 # Should not happen if base is min
-                    
-                    delta_ns_total = delta_clock * 50 # 50ns per tick (20 MHz)
+                    delta_clock = max(0, timing - base_clock)  # Clock ticks since first particle
+                    delta_ns_total = delta_clock * self.CLOCK_TICK_NS  # Convert to nanoseconds
                     
                     # Get buffer wall time
                     base_dt = self.datetimes[buf_idx]
