@@ -2,6 +2,7 @@
 import os
 import datetime
 import numpy
+import pandas as pd
 from nrc_spifpy.input.binary_file import BinaryFile
 from nrc_spifpy.images import Images
 
@@ -11,6 +12,7 @@ from concurrent.futures import wait
 from tqdm import tqdm
 import time
 import gc
+
 
 class Fast2DSFile(BinaryFile):
     """
@@ -53,7 +55,7 @@ class Fast2DSFile(BinaryFile):
     SYNC_NL = 0x4C4E          # NULL packet header
     RLE_FULL_SHADED = 0x4000  # Fully shaded slice (128 pixels)
     RLE_UNCOMPRESSED = 0x7FFF # Next 8 words are raw bitmap
-    CLOCK_TICK_NS = 50        # 48-bit clock resolution: 50 ns (20 MHz)
+    # Note: Timing uses frame timestamp interpolation (not fixed clock tick)
 
     # =========================================================================
     # Phase 1: Initialization
@@ -153,19 +155,27 @@ class Fast2DSFile(BinaryFile):
             print(f"Error reading HK file: {e}")
             return None
 
+
     def calc_buffer_datetimes(self):
-        """ Calculates datetimes from buffers read in from file and sets
-        to datetimes class attribute.
-        Override to include milliseconds.
+        """ Calculates datetimes from buffers read in from file.
+        Override to include milliseconds using vectorized pandas/numpy.
         """
-        self.datetimes = [datetime.datetime(d['year'],
-                                            d['month'],
-                                            d['day'],
-                                            d['hour'],
-                                            d['minute'],
-                                            d['second'],
-                                            d['ms'] * 1000) for d in self.data]
-        self.datetimes = numpy.array(self.datetimes)
+        # Ensure start_date is set
+        if not hasattr(self, 'start_date') or self.start_date is None:
+             self.get_start_date()
+
+        # Build datetime64 array directly from buffer fields
+        df = pd.DataFrame({
+            'year': self.data['year'],
+            'month': self.data['month'],
+            'day': self.data['day'],
+            'hour': self.data['hour'],
+            'minute': self.data['minute'],
+            'second': self.data['second'],
+            'microsecond': self.data['ms'].astype(numpy.int64) * 1000  # ms -> us
+        })
+        self.datetimes = pd.to_datetime(df).values  # numpy datetime64[ns] array
+
 
     def _align_hk_to_frames(self):
         """
@@ -174,44 +184,60 @@ class Fast2DSFile(BinaryFile):
         if self.hk_data is None or self.datetimes is None:
             return
 
-        # 1. Convert HK timestamps to unix timestamps (skip invalid records)
-        hk_ts = []
-        valid_indices = []
-        for idx, d in enumerate(self.hk_data):
-            try:
-                # Validate timestamp fields before constructing datetime
-                year = int(d['ts_year'])
-                month = int(d['ts_month'])
-                day = int(d['ts_day'])
-                hour = int(d['ts_hour'])
-                minute = int(d['ts_min'])
-                second = int(d['ts_sec'])
-                ms = int(d['ts_ms'])
-                
-                if not (1 <= month <= 12 and 1 <= day <= 31 and 
-                        0 <= hour <= 23 and 0 <= minute <= 59 and
-                        0 <= second <= 59 and 2000 <= year <= 2100):
-                    continue
-                    
-                dt = datetime.datetime(year, month, day, hour, minute, second, ms * 1000)
-                hk_ts.append(dt.timestamp())
-                valid_indices.append(idx)
-            except (ValueError, OverflowError):
-                # Skip invalid timestamp records
-                continue
+        # 1. Convert HK timestamps to unix timestamps (Vectorized)
+        data = self.hk_data
         
-        if len(hk_ts) == 0:
+        # Extract components safely
+        years = data['ts_year'].astype(numpy.int32)
+        months = data['ts_month'].astype(numpy.int32)
+        days = data['ts_day'].astype(numpy.int32)
+        hours = data['ts_hour'].astype(numpy.int32)
+        minutes = data['ts_min'].astype(numpy.int32)
+        seconds = data['ts_sec'].astype(numpy.int32)
+        ms = data['ts_ms'].astype(numpy.int32)
+
+        # Validity mask to filter bad records
+        valid_mask = (
+            (months >= 1) & (months <= 12) &
+            (days >= 1) & (days <= 31) &
+            (hours >= 0) & (hours <= 23) &
+            (minutes >= 0) & (minutes <= 59) &
+            (seconds >= 0) & (seconds <= 59) &
+            (years >= 2000) & (years <= 2100)
+        )
+        
+        valid_indices = numpy.nonzero(valid_mask)[0]
+        
+        if len(valid_indices) == 0:
             print("Warning: No valid HK timestamps found.")
             self.tas = numpy.zeros(len(self.datetimes))
             self.user_temp = numpy.zeros(len(self.datetimes))
             self.ps_temp = numpy.zeros(len(self.datetimes))
             return
+
+        # Convert to unix timestamps
+        ts_df = pd.DataFrame({
+            'year': years[valid_indices],
+            'month': months[valid_indices],
+            'day': days[valid_indices],
+            'hour': hours[valid_indices],
+            'minute': minutes[valid_indices],
+            'second': seconds[valid_indices],
+            'microsecond': ms[valid_indices] * 1000  # ms -> us
+        })
+
+        # Convert to nanoseconds (float64)
+        hk_ts = pd.to_datetime(ts_df).values.astype(numpy.float64)
+
+        if len(hk_ts) == 0:
+            print("Warning: No valid HK timestamps found after conversion.")
+            self.tas = numpy.zeros(len(self.datetimes))
+            self.user_temp = numpy.zeros(len(self.datetimes))
+            self.ps_temp = numpy.zeros(len(self.datetimes))
+            return
             
-        hk_ts = numpy.array(hk_ts)
-        valid_indices = numpy.array(valid_indices)
-        
-        # 2. Convert Frame timestamps to unix timestamps
-        frame_ts = numpy.array([dt.timestamp() for dt in self.datetimes])
+        # 2. Convert Frame timestamps to nanoseconds (float64)
+        frame_ts = self.datetimes.astype(numpy.float64)
         
         # 3. Extract and Interpolate Channels (use only valid HK records)
         
@@ -247,6 +273,7 @@ class Fast2DSFile(BinaryFile):
         raw_ps = self.hk_data['data'][valid_indices, 21]
         ps_temp = raw_ps * 0.07323 - 64.8
         self.ps_temp = numpy.interp(frame_ts, hk_ts, ps_temp)
+
 
     # =========================================================================
     # Phase 3: Parallel Processing (Main Entry Point)
@@ -326,8 +353,8 @@ class Fast2DSFile(BinaryFile):
         pbar1.close()
         pbar2.close()
         
-        
         print(f'Finished. {tot_h}-H, {tot_v}-V images processed in {time.time()-t00:.2f}s')
+
 
     def process_frames(self, chunk):
         """
@@ -391,6 +418,7 @@ class Fast2DSFile(BinaryFile):
         
         idx = start_idx
         limit = len(record) # Limit for processing loop
+        reach_record_end = False
         next_start_idx = 0
         
         # Main particle scanning loop
@@ -401,22 +429,28 @@ class Fast2DSFile(BinaryFile):
             if word == self.SYNC_2S:
                 # Parse 5-word header: [2S, NHraw, NVraw, PID, Slices]
                 if idx + 5 <= limit:
-                    nh_raw = record[idx+1]  # Horizontal word count + flags
-                    nv_raw = record[idx+2]  # Vertical word count + flags
-                    pid = record[idx+3]      # Particle ID
-                    slices = record[idx+4]   # Expected slice count
-                else:
-                    # Header spans frame boundary - stitch from both frames
-                    if not next_record_exists: 
-                        break
-                    temp_header = list(record[idx:])  # Current frame portion
-                    needed = 5 - len(temp_header)
-                    temp_header.extend(record_next[:needed])  # Next frame portion
+                    nh_temp = record[idx+1] & 0x0FFF
+                    nv_temp = record[idx+2] & 0x0FFF
+                    n_temp = nh_temp if nh_temp > 0 else nv_temp
                     
-                    nh_raw = temp_header[1]
-                    nv_raw = temp_header[2]
-                    pid = temp_header[3]
-                    slices = temp_header[4]
+                    if idx + 5 + n_temp > limit:
+                        reach_record_end = True
+                else:
+                    reach_record_end = True
+
+                if reach_record_end:
+                    if next_record_exists:
+                        # Extend record with next frame
+                        record = numpy.concatenate((record, record_next))
+                        # Note: 'limit' still refers to original frame boundary
+                    else:
+                        break  # EOF 
+
+                # Decode Header
+                nh_raw = record[idx+1]
+                nv_raw = record[idx+2]
+                pid = record[idx+3]
+                slices = record[idx+4]
                 
                 # Extract word count from bits 11-0 (mask 0x0FFF = 4095)
                 nh = nh_raw & 0x0FFF
@@ -434,27 +468,8 @@ class Fast2DSFile(BinaryFile):
                 data_start = idx + 5
                 data_end = data_start + n_words
                 
-                # Check if data spans to next frame
-                if data_end > limit:
-                     # Packet spans to next frame -> LOOK AHEAD
-                     if next_record_exists:
-                         words_needed = data_end - limit
-                         next_start_idx = words_needed # Tell next frame to skip these
-                         
-                         chunk_next = record_next[:words_needed]
-                         
-                         # Construct full packet data
-                         # Part in current
-                         if data_start < limit:
-                             full_packet_data = numpy.concatenate((record[data_start:], chunk_next))
-                         else:
-                             full_packet_data = record_next[data_start - limit : data_end - limit]
-                        
-                     else:
-                         break # EOF mid-packet
-                else:
-                     # Packet fully in current frame
-                     full_packet_data = record[data_start:data_end]
+                # Packet data
+                full_packet_data = record[data_start:data_end]
                 
                 # --- Decoding Logic ---
                 
@@ -527,10 +542,10 @@ class Fast2DSFile(BinaryFile):
                         
                         if startslice == 1 and len(state['slice_decomp']) > 0:
                             # Start of new slice - finalize previous
-                            if len(state['slice_decomp']) % 128 > 0:
-                                state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
-                            state['img_decomp'].extend(state['slice_decomp'])
-                            state['slice_decomp'] = []
+                                if len(state['slice_decomp']) % 128 > 0:
+                                    state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
+                                state['img_decomp'].extend(state['slice_decomp'])
+                                state['slice_decomp'] = []
                         # Append clear pixels then shaded pixels
                         state['slice_decomp'].extend([0] * num_clear)
                         state['slice_decomp'].extend([1] * num_shaded)
@@ -552,11 +567,12 @@ class Fast2DSFile(BinaryFile):
                         v_images.append(img_result)
                     del pending[pid]
 
-                # Update index
-                if data_end > limit:
-                     idx = limit + 1 # Break loop
-                else:
-                     idx = data_end
+                # Exit loop after spanning particle (it was the last one in this frame)
+                if reach_record_end:
+                    next_start_idx = data_end - limit
+                    break
+                    
+                idx = data_end
             
             elif word == self.SYNC_NL:  # 0x4C4E: NULL packet (FIFO flush/padding)
                 idx += 1
@@ -566,207 +582,208 @@ class Fast2DSFile(BinaryFile):
                 
         return {'h': h_images, 'v': v_images, 'next_idx': next_start_idx}
 
+
     # =========================================================================
     # Phase 5: Image Conversion
     # =========================================================================
 
-    def extract_images(self, buffer):
+    def _build_frame_timing_table(self):
+        """
+        Build a table of (frame_timestamp, first_timing_word) for each frame.
+        This is used for interpolating precise particle times.
+        
+        Only uses single-packet particles (is_multi_packet=0) since multi-packet
+        particles have timing at the end of the last packet, not after the header.
+        """
+        frame_timing = []
+        
+        for frame_idx in range(len(self.data)):
+            record = self.data[frame_idx]['data']
+            
+            # Find first single-packet particle with valid timing in this frame
+            first_timing = None
+            idx = 0
+            while idx < len(record) - 5:
+                if record[idx] == self.SYNC_2S:
+                    nh_raw = record[idx + 1]
+                    nh = nh_raw & 0x0FFF
+                    nv = int(record[idx + 1]) & 0x0FFF if nh == 0 else 0
+                    n_words = nh if nh > 0 else nv
+                    
+                    # Check if this is a single-packet particle (bit 12 = 0)
+                    is_multi_packet = ((nh_raw if nh > 0 else record[idx + 1]) & 0x1000) >> 12
+                    
+                    if n_words > 0 and is_multi_packet == 0:
+                        # Single-packet: timing is at END of packet data (last 3 words)
+                        # Packet structure: [2S, NHraw, NVraw, PID, Slices, ...data..., T_MSW, T_ISW, T_LSW]
+                        # Data starts at idx+5, ends at idx+5+n_words
+                        # Timing is at idx+5+n_words-3, idx+5+n_words-2, idx+5+n_words-1
+                        data_end = idx + 5 + n_words
+                        if data_end <= len(record):
+                            t_msw = int(record[data_end - 3])
+                            t_isw = int(record[data_end - 2])
+                            t_lsw = int(record[data_end - 1])
+                            first_timing = (t_msw << 32) | (t_isw << 16) | t_lsw
+                        break
+                    else:
+                        # Multi-packet or empty: skip to next particle
+                        data_start = idx + 5
+                        data_end = data_start + n_words
+                        if data_end <= len(record):
+                            idx = data_end
+                        else:
+                            break  # Spans to next frame
+                        continue
+                idx += 1
+            
+            if first_timing is not None:
+                # Use RELATIVE seconds from start_date (same as buffer_sec)
+                # For numpy datetime64: subtract and convert to float seconds
+                frame_sec = (self.datetimes[frame_idx] - numpy.datetime64(self.start_date)) / numpy.timedelta64(1, 's')
+                frame_timing.append({
+                    'frame_idx': frame_idx,
+                    'timestamp': frame_sec,  # Now relative, not absolute
+                    'timing': first_timing
+                })
+        
+        return frame_timing
+
+
+    def _vectorized_interpolate(self, timings, frame_timing_table):
+        """
+        Helper for vectorized interpolation using pre-calculated timing table.
+        """
+        if not frame_timing_table or len(timings) == 0:
+            return numpy.array([], dtype=numpy.int64), numpy.array([], dtype=numpy.int64)
+        
+        # Convert table to arrays (cached if possible, but fast enough here)
+        if not hasattr(self, '_ft_timings') or self._ft_timings is None or len(self._ft_timings) != len(frame_timing_table):
+            self._ft_timings = numpy.array([x['timing'] for x in frame_timing_table], dtype=numpy.int64)
+            self._ft_timestamps = numpy.array([x['timestamp'] for x in frame_timing_table], dtype=numpy.float64)
+        
+        ft_timings = self._ft_timings
+        ft_timestamps = self._ft_timestamps
+        n_frames = len(ft_timings)
+        
+        if n_frames < 2:
+            return numpy.array([], dtype=numpy.int64), numpy.array([], dtype=numpy.int64)
+
+        # 1. Find indices in the table
+        idxs = numpy.searchsorted(ft_timings, timings, side='right')
+        
+        # 2. Handle extrapolation cases
+        segment_idxs = idxs.copy()
+        segment_idxs[segment_idxs == 0] = 1 
+        segment_idxs[segment_idxs >= n_frames] = n_frames - 1 
+        
+        # 3. Gather T1, T2, t1, t2
+        right_indices = segment_idxs
+        left_indices = segment_idxs - 1
+        
+        T1 = ft_timestamps[left_indices]
+        T2 = ft_timestamps[right_indices]
+        t1 = ft_timings[left_indices]
+        t2 = ft_timings[right_indices]
+        
+        # 4. Interpolate
+        denom = (t2 - t1).astype(numpy.float64)
+        mask = denom == 0
+        denom[mask] = 1.0 
+        
+        fraction = (timings - t1) / denom
+        particle_ts = T1 + fraction * (T2 - T1)
+        particle_ts[mask] = T1[mask]
+        
+        # 5. Convert to sec/ns
+        sec_arr = particle_ts.astype(numpy.int64)
+        ns_arr = ((particle_ts - sec_arr) * 1e9).astype(numpy.int64)
+        
+        return sec_arr, ns_arr
+
+
+    def extract_images(self, buffer, frame_timing_table=None):
         """
         Implementation of the abstract extract_images method.
         Slices the buffer into individual Image objects.
         Returns separate Images objects for H and V channels to match SPECFile structure.
+        
+        Uses frame timestamp interpolation with VECTORIZED numpy operations for speed:
+        T_particle = T_frame1 + (T_frame2 - T_frame1) * (timing - timing1) / (timing2 - timing1)
         """
         h_imgs = Images(self.aux_channels)
         v_imgs = Images(self.aux_channels)
         
-        # 1. Group particles by buffer index and find baseline clock for each buffer
-        # This assumes particles within a buffer share a common time reference (start of buffer)
-        # We align the first particle's clock to the buffer timestamp.
+        # Build frame timing table if not provided
+        if frame_timing_table is None:
+            frame_timing_table = getattr(self, '_frame_timing_table', None)
+            if frame_timing_table is None:
+                frame_timing_table = self._build_frame_timing_table()
+                self._frame_timing_table = frame_timing_table
         
-        buffer_baselines = {}
-        all_particles = []
-        if 'h' in buffer: all_particles.extend(buffer['h'])
-        if 'v' in buffer: all_particles.extend(buffer['v'])
-        
-        for p in all_particles:
-            buf_idx = p.get('buffer_index', -1)
-            time_clock = p.get('time', 0)
-            if buf_idx not in buffer_baselines:
-                 buffer_baselines[buf_idx] = time_clock
-            else:
-                 if time_clock < buffer_baselines[buf_idx]:
-                      buffer_baselines[buf_idx] = time_clock
+        # Process each channel with vectorization
+        for channel_name, imgs_obj in [('h', h_imgs), ('v', v_imgs)]:
+            img_list = buffer.get(channel_name, [])
+            if not img_list:
+                continue
+                
+            # 1. First pass: Collect all data into lists
+            raw_data_list = []
+            timings_list = []
+            buf_indices_list = []
+            
+            # Filter valid images and extract data
+            for img_dict in img_list:
+                if 'data' in img_dict and len(img_dict['data']) > 0:
+                     raw_data_list.append(img_dict)
+                     timings_list.append(img_dict.get('time', 0))
+                     buf_indices_list.append(img_dict.get('buffer_index', 0))
+            
+            if not raw_data_list:
+                continue
 
-        # 2. Process Horizontal Channel
-        for img_dict in buffer['h']:
-            if 'data' in img_dict and len(img_dict['data']) > 0:
-                try:
-                    # Flatten image data to 1D array
-                    image_data = numpy.array(img_dict['data'], dtype=numpy.uint8)
-                    
-                    buf_idx = img_dict.get('buffer_index', 0)
-                    timing = img_dict.get('time', 0)
-                    
-                    # Calculate precise particle time from 48-bit clock
-                    # Formula: T_particle = T_buffer + (Clock_particle - Clock_min) * CLOCK_TICK_NS
-                    base_clock = buffer_baselines.get(buf_idx, timing)
-                    delta_clock = max(0, timing - base_clock)  # Clock ticks since first particle
-                    delta_ns_total = delta_clock * self.CLOCK_TICK_NS  # Convert to nanoseconds
-                    
-                    # Get buffer wall time
-                    base_dt = self.datetimes[buf_idx]
-                    base_sec = int(base_dt.timestamp())
-                    base_ns = base_dt.microsecond * 1000
-                    
-                    total_ns = base_ns + delta_ns_total
-                    add_sec = total_ns // 1000000000
-                    rem_ns = total_ns % 1000000000
-                    
-                    sec = base_sec + add_sec
-                    ns = int(rem_ns)
-                    
-                    h_imgs.image.append(image_data)
-                    h_imgs.ns.append(ns)
-                    h_imgs.sec.append(sec)
-                    # h_imgs.length.append(img_dict.get('slices', len(image_data) // 128))
-                    h_imgs.length.append(len(image_data) // 128) # Force calc from data
-                    h_imgs.buffer_index.append(img_dict.get('buffer_index', 0))
-                    
-                    # Populate Aux Channels
-                    if len(self.tas) > buf_idx:
-                         h_imgs.tas.append(self.tas[buf_idx])
-                    else:
-                         h_imgs.tas.append(0.0) # Should not happen
-                         
-                except (ValueError, TypeError):
-                    pass
-
-        # Process Vertical Channel
-        for img_dict in buffer['v']:
-            if 'data' in img_dict and len(img_dict['data']) > 0:
+            # 2. Calculate precise timing using interpolated particle times
+            # Use the 48-bit timing words collected in timings_list
+            timings_arr = numpy.array(timings_list, dtype=numpy.int64)
+            
+            # Use vectorized interpolation
+            sec_array, ns_array = self._vectorized_interpolate(timings_arr, frame_timing_table)
+            
+            # Fallback if interpolation returns empty (shouldn't happen if len > 0)
+            if len(sec_array) != len(timings_arr):
+                # 2. Calculate precise timing from buffer timestamps directly
+                # This is simpler and more reliable than 48-bit timing word interpolation
+                buf_indices_arr = numpy.array(buf_indices_list, dtype=numpy.int64)
+                
+                # Get buffer_sec for each particle (relative seconds from start_date)
+                sec_array = numpy.zeros(len(buf_indices_arr), dtype=numpy.int64)
+                ns_array = numpy.zeros(len(buf_indices_arr), dtype=numpy.int64)
+                
+                for i, buf_idx in enumerate(buf_indices_arr):
+                    # For numpy datetime64: subtract and convert to float seconds
+                    dt64 = self.datetimes[buf_idx]
+                    delta = (dt64 - numpy.datetime64(self.start_date)) / numpy.timedelta64(1, 's')
+                    sec_array[i] = int(delta)
+                    ns_array[i] = int((delta - sec_array[i]) * 1e9)
+            
+            # 3. Populate Images object
+            for i, img_dict in enumerate(raw_data_list):
                 try:
                     image_data = numpy.array(img_dict['data'], dtype=numpy.uint8)
                     
-                    buf_idx = img_dict.get('buffer_index', 0)
-                    timing = img_dict.get('time', 0)
+                    imgs_obj.image.append(image_data)
+                    imgs_obj.ns.append(int(ns_array[i]))
+                    imgs_obj.sec.append(int(sec_array[i]))
+                    imgs_obj.length.append(len(image_data) // 128)
                     
-                    # Calculate precise time
-                    base_clock = buffer_baselines.get(buf_idx, timing)
-                    delta_clock = timing - base_clock
-                    if delta_clock < 0: delta_clock = 0
+                    buf_idx = buf_indices_list[i]
+                    imgs_obj.buffer_index.append(buf_idx)
                     
-                    delta_ns_total = delta_clock * 50
-                    
-                    base_dt = self.datetimes[buf_idx]
-                    base_sec = int(base_dt.timestamp())
-                    base_ns = base_dt.microsecond * 1000
-                    
-                    total_ns = base_ns + delta_ns_total
-                    add_sec = total_ns // 1000000000
-                    rem_ns = total_ns % 1000000000
-                    
-                    sec = base_sec + add_sec
-                    ns = int(rem_ns)
-                    
-                    v_imgs.image.append(image_data)
-                    v_imgs.ns.append(ns)
-                    v_imgs.sec.append(sec)
-                    # v_imgs.length.append(img_dict.get('slices', len(image_data) // 128))
-                    v_imgs.length.append(len(image_data) // 128) # Force calc from data
-                    v_imgs.buffer_index.append(img_dict.get('buffer_index', 0))
-                    
-                    # Populate Aux Channels
                     if len(self.tas) > buf_idx:
-                         v_imgs.tas.append(self.tas[buf_idx])
+                        imgs_obj.tas.append(self.tas[buf_idx])
                     else:
-                         v_imgs.tas.append(0.0)
-
+                        imgs_obj.tas.append(0.0)
+                        
                 except (ValueError, TypeError):
                     pass
         
         return h_imgs, v_imgs
-
-    # =========================================================================
-    # Phase 6: Time Refinement
-    # =========================================================================
-
-    def calc_image_times(self, spiffile):
-        """
-        Recalculates image times based on clock counts and buffer times.
-        Adapted from SPECFile.calc_image_times for Fast 2DS (48-bit clock).
-        """
-        inst_groups = [self.name + '-H', self.name + '-V']
-        
-        # Define needed parameters for recomputing times
-        times = numpy.array(self.datetimes, dtype='datetime64[ns]') - numpy.datetime64(self.start_date)
-        secs = times.astype('timedelta64[s]')
-        ns = times - secs
-        datetimes = secs.astype(float) + ns.astype(float) * 1e-9
-
-        # Iterate over instrument groups in current file
-        for i, inst_group in enumerate(inst_groups):
-            if inst_group not in spiffile.instgrps:
-                continue
-
-            # Read relevant parameters from spiffile (access core group directly)
-            grp = spiffile.instgrps[inst_group]['core']
-            
-            if 'buffer_index' not in grp.variables or 'image_ns' not in grp.variables:
-                continue
-                
-            buffer_indx = grp['buffer_index'][:]
-            if len(buffer_indx) == 0:
-                continue
-            
-            # Fast 2DS uses TAS from auxiliary file or constant
-            # For now, if TAS is available in variables, use it. Otherwise use constant.
-            if 'tas' in grp.variables:
-                tas = grp['tas'][:]
-                mask = numpy.isnan(tas)
-                if numpy.any(~mask):
-                     tas[mask] = numpy.interp(numpy.flatnonzero(mask), numpy.flatnonzero(~mask), tas[~mask])
-                else:
-                     tas[:] = 100.0 # Fallback
-            else:
-                tas = numpy.ones(len(buffer_indx)) * 100.0 # Fallback
-            
-            # Get timestamp for each image corresponding their parent buffer
-            buffer_time = datetimes[buffer_indx]
-
-            # Re-save buffer time as image_sec + ns
-            # This is a simplified implementation that sets time to buffer time
-            # Ideally we would use the 48-bit clock to add precision, but we only have 32-bits stored in 'image_ns'.
-            # Given the constraints, aligning to buffer time is the first step.
-            epoch_time = numpy.modf(buffer_time)
-            new_secs = epoch_time[1]
-            new_ns = epoch_time[0] * 1e9
-
-            # Save new time to file
-            spiffile.write_variable(grp, 'image_sec', new_secs)
-            spiffile.write_variable(grp, 'image_ns', new_ns)
-
-    # =========================================================================
-    # Helper Functions
-    # =========================================================================
-
-    def _convert_bitmap_to_bits(self, words):
-        """
-        Helper to convert 8 x 16-bit words (bitmap) into a list of 128 bits (0/1).
-        
-        Parameters
-        ----------
-        words : array-like
-            8 uint16 words.
-            
-        Returns
-        -------
-        list
-            List of 128 integers (0 or 1).
-        """
-        bits = []
-        for word in words:
-            # 16 bits per word
-            # Format: 1=Clear, 0=Shaded
-            for i in range(15, -1, -1):
-                bits.append((word >> i) & 1)
-        return bits
