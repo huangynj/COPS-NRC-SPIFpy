@@ -487,9 +487,9 @@ class Fast2DSFile(BinaryFile):
                     payload_data = full_packet_data
                 elif len(full_packet_data) >= 3:
                     # Single/final packet: extract 48-bit timing from last 3 words
-                    timing = (int(full_packet_data[-3]) | 
+                    timing = ((int(full_packet_data[-1]) << 32) | 
                               (int(full_packet_data[-2]) << 16) | 
-                              (int(full_packet_data[-1]) << 32))
+                              (int(full_packet_data[-3])))
                     payload_data = full_packet_data[:-3]
                 else:
                     timing = 0  # Shouldn't happen but handle gracefully
@@ -587,67 +587,6 @@ class Fast2DSFile(BinaryFile):
     # Phase 5: Image Conversion
     # =========================================================================
 
-    def _build_frame_timing_table(self):
-        """
-        Build a table of (frame_timestamp, first_timing_word) for each frame.
-        This is used for interpolating precise particle times.
-        
-        Only uses single-packet particles (is_multi_packet=0) since multi-packet
-        particles have timing at the end of the last packet, not after the header.
-        """
-        frame_timing = []
-        
-        for frame_idx in range(len(self.data)):
-            record = self.data[frame_idx]['data']
-            
-            # Find first single-packet particle with valid timing in this frame
-            first_timing = None
-            idx = 0
-            while idx < len(record) - 5:
-                if record[idx] == self.SYNC_2S:
-                    nh_raw = record[idx + 1]
-                    nh = nh_raw & 0x0FFF
-                    nv = int(record[idx + 1]) & 0x0FFF if nh == 0 else 0
-                    n_words = nh if nh > 0 else nv
-                    
-                    # Check if this is a single-packet particle (bit 12 = 0)
-                    is_multi_packet = ((nh_raw if nh > 0 else record[idx + 1]) & 0x1000) >> 12
-                    
-                    if n_words > 0 and is_multi_packet == 0:
-                        # Single-packet: timing is at END of packet data (last 3 words)
-                        # Packet structure: [2S, NHraw, NVraw, PID, Slices, ...data..., T_MSW, T_ISW, T_LSW]
-                        # Data starts at idx+5, ends at idx+5+n_words
-                        # Timing is at idx+5+n_words-3, idx+5+n_words-2, idx+5+n_words-1
-                        data_end = idx + 5 + n_words
-                        if data_end <= len(record):
-                            t_msw = int(record[data_end - 3])
-                            t_isw = int(record[data_end - 2])
-                            t_lsw = int(record[data_end - 1])
-                            first_timing = (t_msw << 32) | (t_isw << 16) | t_lsw
-                        break
-                    else:
-                        # Multi-packet or empty: skip to next particle
-                        data_start = idx + 5
-                        data_end = data_start + n_words
-                        if data_end <= len(record):
-                            idx = data_end
-                        else:
-                            break  # Spans to next frame
-                        continue
-                idx += 1
-            
-            if first_timing is not None:
-                # Use RELATIVE seconds from start_date (same as buffer_sec)
-                # For numpy datetime64: subtract and convert to float seconds
-                frame_sec = (self.datetimes[frame_idx] - numpy.datetime64(self.start_date)) / numpy.timedelta64(1, 's')
-                frame_timing.append({
-                    'frame_idx': frame_idx,
-                    'timestamp': frame_sec,  # Now relative, not absolute
-                    'timing': first_timing
-                })
-        
-        return frame_timing
-
 
     def _vectorized_interpolate(self, timings, frame_timing_table):
         """
@@ -717,7 +656,34 @@ class Fast2DSFile(BinaryFile):
         if frame_timing_table is None:
             frame_timing_table = getattr(self, '_frame_timing_table', None)
             if frame_timing_table is None:
-                frame_timing_table = self._build_frame_timing_table()
+                # OPTIMIZATION: Build timing table directly from decoded images
+                # This avoids re-scanning the file and ensures consistency
+                temp_timing_map = {} 
+                
+                # Check both channels for valid frame timings
+                for ch in ['h', 'v']:
+                    for img in buffer.get(ch, []):
+                        f_idx = img.get('buffer_index')
+                        t_val = img.get('time')
+                        # Use first valid timing found for each frame
+                        if f_idx is not None and t_val is not None and t_val > 0:
+                            if f_idx not in temp_timing_map:
+                                temp_timing_map[f_idx] = t_val
+                
+                # Convert to sorted list for interpolation
+                frame_timing_table = []
+                sorted_idxs = sorted(temp_timing_map.keys())
+                
+                for f_idx in sorted_idxs:
+                    timing_word = temp_timing_map[f_idx]
+                    # Calculate timestamp (relative seconds)
+                    frame_sec = (self.datetimes[f_idx] - numpy.datetime64(self.start_date)) / numpy.timedelta64(1, 's')
+                    frame_timing_table.append({
+                        'frame_idx': f_idx,
+                        'timestamp': frame_sec,
+                        'timing': timing_word
+                    })
+                
                 self._frame_timing_table = frame_timing_table
         
         # Process each channel with vectorization
