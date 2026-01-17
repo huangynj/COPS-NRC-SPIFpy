@@ -14,6 +14,20 @@ import time
 import gc
 
 
+try:
+    from .fast_2ds_decoder import decode_frame
+    HAS_CYTHON = True
+except ImportError:
+    HAS_CYTHON = False
+
+if os.environ.get('FORCE_PYTHON_F2DS') == '1':
+    HAS_CYTHON = False
+
+if HAS_CYTHON:
+    print("Using cythonized decoder")
+else:
+    print("Using pure python decoder")
+
 class Fast2DSFile(BinaryFile):
     """
     Class for reading and processing SPEC Fast 2D-S (Type 48) probe data.
@@ -411,8 +425,13 @@ class Fast2DSFile(BinaryFile):
             record_next = self.data[frame+1]['data']
             next_record_exists = True
         except (IndexError, KeyError):
+            record_next = numpy.empty(0, dtype=numpy.uint16)
             next_record_exists = False
         
+        if HAS_CYTHON:
+             # Delegate to Cython implementation
+             return decode_frame(record, record_next, next_record_exists, chunk_state, frame, start_idx)
+
         h_images = []
         v_images = []
         
