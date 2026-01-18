@@ -94,7 +94,7 @@ class Fast2DSFile(BinaryFile):
         ])
         
         # Auxiliary channels interpolated from external HK file
-        self.aux_channels = ['tas', 'user_temp', 'ps_temp']
+        self.aux_channels = ['clock_counts', 'tas', 'user_temp', 'ps_temp']
 
     # =========================================================================
     # Phase 2: File Reading
@@ -759,6 +759,7 @@ class Fast2DSFile(BinaryFile):
                     imgs_obj.ns.append(int(ns_array[i]))
                     imgs_obj.sec.append(int(sec_array[i]))
                     imgs_obj.length.append(len(image_data) // 128)
+                    imgs_obj.clock_counts.append(timings_list[i])
                     
                     buf_idx = buf_indices_list[i]
                     imgs_obj.buffer_index.append(buf_idx)
