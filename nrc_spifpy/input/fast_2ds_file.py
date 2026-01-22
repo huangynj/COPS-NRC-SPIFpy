@@ -60,6 +60,10 @@ class Fast2DSFile(BinaryFile):
     Attributes:
         diodes (int): Number of diodes (128 for 2D-S)
         aux_channels (list): Auxiliary data channels from HK file
+
+    History:
+        - 2026-01-22: Yongjie Huang, implemented SODA2 method after discussion with Aaron Bansemer (NSF NCAR).
+        - 2026-01-11: Yongjie Huang, first implementation.
     """
     
     # -------------------------------------------------------------------------
@@ -75,9 +79,10 @@ class Fast2DSFile(BinaryFile):
     # Phase 1: Initialization
     # =========================================================================
 
-    def __init__(self, filename, inst_name, resolution):
+    def __init__(self, filename, inst_name, resolution, time_method='soda2'):
         super().__init__(filename, inst_name, resolution)
         self.diodes = 128  # 2D-S has 128 photodiodes
+        self.time_method = time_method
         
         # Data block dtype: 4114 bytes = 16 (timestamp) + 4096 (data) + 2 (checksum)
         self.file_dtype = numpy.dtype([
@@ -297,6 +302,9 @@ class Fast2DSFile(BinaryFile):
         """
         Orchestrates parallel processing of the file.
         Uses per-chunk state for cross-frame particle handling within each parallel worker.
+
+        History:
+            - 2026-01-11: Yongjie Huang, first implementation.
         """
         if processors is None:
             processors = os.cpu_count() - 1 if os.cpu_count() > 1 else 1
@@ -374,6 +382,9 @@ class Fast2DSFile(BinaryFile):
         """
         Process a chunk of frames indices.
         State is initialized per-chunk for parallel processing compatibility.
+
+        History:
+            - 2026-01-11: Yongjie Huang, first implementation.
         """
         h_accum = []
         v_accum = []
@@ -417,6 +428,9 @@ class Fast2DSFile(BinaryFile):
         -------
         dict
             {'h': h_images, 'v': v_images, 'next_idx': next_start_idx}
+
+        History:
+            - 2026-01-11: Yongjie Huang, first implementation.
         """
         record = self.data[frame]['data']
         
@@ -610,6 +624,9 @@ class Fast2DSFile(BinaryFile):
     def _vectorized_interpolate(self, timings, frame_timing_table):
         """
         Helper for vectorized interpolation using pre-calculated timing table.
+
+        History:
+            - 2026-01-16: Yongjie Huang, first implementation.
         """
         if not frame_timing_table or len(timings) == 0:
             return numpy.array([], dtype=numpy.int64), numpy.array([], dtype=numpy.int64)
@@ -659,6 +676,77 @@ class Fast2DSFile(BinaryFile):
         return sec_arr, ns_arr
 
 
+    def _soda2_calculate_times(self, timings, buf_indices, frame_timing_table):
+        """
+        Calculates timing using SODA2-style method:
+        Time = FrameTime + (Count - FrameStartCount) * (Resolution / TAS)
+        
+        This relies on physical distance traveled (Slice Count * Resolution) 
+        divided by True Air Speed (TAS) to determine the time elapsed since the frame start.
+
+        History:
+          - 2026-01-22: Yongjie Huang, implemented SODA2 method after discussion with Aaron Bansemer (NSF NCAR).     
+        """
+        if not frame_timing_table or len(timings) == 0:
+            return numpy.array([], dtype=numpy.int64), numpy.array([], dtype=numpy.int64)
+
+        # 1. Prepare Frame Data Arrays (Start Count, Start Timestamp, TAS)
+        n_frames = len(self.datetimes)
+        
+        # Frame Start Counts (from timing table)
+        # Initialize with -1 or similar to detect missing frames if needed, 
+        # but frame_timing_table should cover visited frames.
+        frame_start_counts = numpy.zeros(n_frames, dtype=numpy.int64)
+        for entry in frame_timing_table:
+            f_idx = entry['frame_idx']
+            if f_idx < n_frames:
+                frame_start_counts[f_idx] = entry['timing']
+                
+        # Frame Start Timestamps (Seconds from file start)
+        frame_start_secs = (self.datetimes - numpy.datetime64(self.start_date)) / numpy.timedelta64(1, 's')
+        
+        # TAS per frame (ensure it's valid)
+        frame_tas = self.tas.copy()
+        frame_tas[frame_tas < 0.1] = 100.0 # Avoid division by zero, default to reasonable TAS if missing
+        
+        # 2. Map particles to their frame properties
+        # buf_indices is the frame index for each particle
+        p_frame_indices = buf_indices.astype(numpy.int64)
+        
+        # Gather properties for each particle
+        p_start_counts = frame_start_counts[p_frame_indices]
+        p_start_times = frame_start_secs[p_frame_indices]
+        p_tas = frame_tas[p_frame_indices]
+        
+        # 3. Calculate Delta Count (Distance in slices)
+        # Handle 48-bit rollover case if necessary, though 48-bit is huge.
+        delta_counts = timings - p_start_counts
+        
+        # If delta is negative, it might be a rollover or out-of-order packet.
+        # Simple rollover correction (assuming monotonic increasing except wrap):
+        # But 48-bit wrap is at 2.8e14. Unlikely to wrap within a flight.
+        # If it happens, we assume simple wrap.
+        # However, delta < 0 might also happen if "first valid timing" found was not the absolute first.
+        # In that case, negative time relative to anchor is fine, it just means it's before the anchor.
+        
+        # 4. Calculate Duration
+        # Time = Delta_Count * (Resolution_um * 1e-6) / TAS_m_s
+        # Resolution is in microns (e.g. 10).
+        # freq = resolution_m / tas_m_s = (res * 1e-6) / tas
+        
+        resolution_m = self.resolution * 1.0e-6
+        dt_seconds = delta_counts * (resolution_m / p_tas)
+        
+        # 5. Absolute Time
+        particle_times = p_start_times + dt_seconds
+        
+        # 6. Convert to sec / ns
+        sec_arr = particle_times.astype(numpy.int64)
+        ns_arr = ((particle_times - sec_arr) * 1e9).astype(numpy.int64)
+        
+        return sec_arr, ns_arr
+
+
     def extract_images(self, buffer, frame_timing_table=None):
         """
         Implementation of the abstract extract_images method.
@@ -667,6 +755,11 @@ class Fast2DSFile(BinaryFile):
         
         Uses frame timestamp interpolation with VECTORIZED numpy operations for speed:
         T_particle = T_frame1 + (T_frame2 - T_frame1) * (timing - timing1) / (timing2 - timing1)
+
+        History:
+            - 2026-01-22: Yongjie Huang, added SODA2 timing method.
+            - 2026-01-16: Yongjie Huang, optimized with vectorized interpolation.
+            - 2026-01-11: Yongjie Huang, first implementation.
         """
         h_imgs = Images(self.aux_channels)
         v_imgs = Images(self.aux_channels)
@@ -730,8 +823,13 @@ class Fast2DSFile(BinaryFile):
             # Use the 48-bit timing words collected in timings_list
             timings_arr = numpy.array(timings_list, dtype=numpy.int64)
             
-            # Use vectorized interpolation
-            sec_array, ns_array = self._vectorized_interpolate(timings_arr, frame_timing_table)
+            # Use SODA2 method or vectorized interpolation
+            if self.time_method == 'soda2':
+                # SODA2 requires buffer indices to look up TAS and Frame Start
+                buf_indices_arr = numpy.array(buf_indices_list, dtype=numpy.int64)
+                sec_array, ns_array = self._soda2_calculate_times(timings_arr, buf_indices_arr, frame_timing_table)
+            else: 
+                sec_array, ns_array = self._vectorized_interpolate(timings_arr, frame_timing_table)
             
             # Fallback if interpolation returns empty (shouldn't happen if len > 0)
             if len(sec_array) != len(timings_arr):
