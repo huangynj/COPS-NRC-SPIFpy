@@ -591,7 +591,9 @@ class Fast2DSFile(BinaryFile):
                             state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
                         state['img_decomp'].extend(state['slice_decomp'])
                     
-                    final_data = [1 - x for x in state['img_decomp']]
+                    final_buffer = bytearray(state['img_decomp'])
+                    final_data = numpy.frombuffer(final_buffer, dtype=numpy.uint8)
+                    numpy.bitwise_xor(final_data, 1, out=final_data)
                     
                     img_result = {'id': pid, 'slices': slices, 'time': timing, 'data': final_data, 'buffer_index': frame}
                     if is_horiz:
@@ -851,7 +853,7 @@ class Fast2DSFile(BinaryFile):
             # 3. Populate Images object
             for i, img_dict in enumerate(raw_data_list):
                 try:
-                    image_data = numpy.array(img_dict['data'], dtype=numpy.uint8)
+                    image_data = numpy.ascontiguousarray(img_dict['data'], dtype=numpy.uint8)
                     
                     imgs_obj.image.append(image_data)
                     imgs_obj.ns.append(int(ns_array[i]))

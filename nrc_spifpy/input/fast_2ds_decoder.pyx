@@ -48,6 +48,8 @@ def decode_frame(
         list img_decomp
         list slice_decomp
         int non_compressed
+        bytearray final_buffer
+        np.ndarray final_data
         
     while idx < limit:
         word = record[idx]
@@ -225,24 +227,11 @@ def decode_frame(
                                slice_decomp.append(0)
                      img_decomp.extend(slice_decomp)
                  
-                 # Invert Logic: final_data = [1 - x for x in state['img_decomp']]
-                 # We stored 1 for Shaded, 0 for Clear.
-                 # Wait, original Code:
-                 #   bin_line: 1(in '1') -> 0. 0(in '0') -> 1.
-                 #   So internal img_decomp has: 1=Shaded/Particle, 0=Clear.
-                 #   Final Data conversion: 1 - x.
-                 #   So Final: 1(Shaded) -> 0. 0(Clear) -> 1.
-                 #   Wait, usually 0 is background (clear) and 1 is particle?
-                 #   Or 0 is black (particle) and 1 is white?
-                 #   Standard image array: usually 1 is particle?
-                 #   Let's check fast_2ds_file.py: "1=Start Slice".
-                 #   Docstring: "Data Block Format...".
-                 #   Let's trust the logic `final_data = [1 - x for x in state['img_decomp']]`.
-                 #   Since I produced `img_decomp` with 1=Shaded, `1-x` makes 0=Shaded.
-                 
-                 final_data = [] # New list
-                 for x in img_decomp:
-                     final_data.append(1 - x)
+                 # bytearray performs the list conversion efficiently and owns
+                 # the compact NumPy buffer. Invert internal shaded/clear bits.
+                 final_buffer = bytearray(img_decomp)
+                 final_data = np.frombuffer(final_buffer, dtype=np.uint8)
+                 np.bitwise_xor(final_data, 1, out=final_data)
                  
                  img_result = {
                      'id': pid, 
