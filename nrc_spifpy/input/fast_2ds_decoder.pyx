@@ -97,9 +97,12 @@ def decode_frame(
                     words_needed = data_end - limit
                     next_start_idx = words_needed
                     
-                    full_packet_data = [record[k] for k in range(data_start, limit)]
-                    for k in range(words_needed):
-                        full_packet_data.append(record_next[k])
+                    if data_start < limit:
+                        full_packet_data = [record[k] for k in range(data_start, limit)]
+                        for k in range(words_needed):
+                            full_packet_data.append(record_next[k])
+                    else:
+                        full_packet_data = [record_next[k - limit] for k in range(data_start, data_end)]
                 else:
                     break # EOF logic
             else:
