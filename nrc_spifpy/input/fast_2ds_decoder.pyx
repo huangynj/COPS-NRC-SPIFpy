@@ -67,10 +67,11 @@ def decode_frame(
                     break
                 # Construct temp header manually
                 # Not optimizing this edge case heavily as it's rare per frame (max 1)
-                # Fallback to Python-like stitching logic or just careful indexing
-                # Simplified:
+                words_needed = 5 - (limit - idx)
+                if words_needed > record_next.shape[0]:
+                    break
                 temp_header = [record[k] for k in range(idx, limit)]
-                for k in range(5 - len(temp_header)):
+                for k in range(words_needed):
                     temp_header.append(record_next[k])
                 
                 nh_raw = temp_header[1]
@@ -97,6 +98,13 @@ def decode_frame(
             if data_end > limit:
                 if next_record_exists:
                     words_needed = data_end - limit
+                    if words_needed > record_next.shape[0]:
+                        print(
+                            f'Warning: Fast 2DS packet at frame {frame_idx}, '
+                            f'word {idx} spans more than two frames '
+                            f'(n_words={n_words}); packet skipped.'
+                        )
+                        break
                     next_start_idx = words_needed
                     
                     if data_start < limit:
@@ -238,17 +246,8 @@ def decode_frame(
                      'slices': slices, 
                      'time': timing, 
                      'data': final_data, 
-                     'buffer_index': frame_idx 
+                     'buffer_index': frame_idx,
                  }
-                 # Wait `buffer_index` in original code was `frame` (the loop var).
-                 # Here I passed `frame` logic implicitly via record, but need the index.
-                 # I'll pass `frame_idx` separately? No, `extract_images` fixes it up later?
-                 # The return dict has 'buffer_index': frame.
-                 # I should pass `frame_index` to this function? Or just put a placeholder.
-                 # The caller `process_frame_with_state` has `frame`.
-                 # I will just pass it back. I should add `frame_idx` argument to this function.
-                 # For now, I'll use a placeholder or handle it in Python wrapper.
-                 # Actually, let's add `frame_idx` argument.
                  
                  if is_horiz:
                      h_images.append(img_result)
