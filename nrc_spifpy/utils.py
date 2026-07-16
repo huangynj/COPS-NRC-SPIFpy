@@ -31,7 +31,7 @@ def convert_datetimes_to_seconds(start_date, datetimes):
         return datetimes_seconds
 
     datetimes_seconds = [(dt - start_date).total_seconds() for dt in datetimes]
-    
+
     return datetimes_seconds
 
 

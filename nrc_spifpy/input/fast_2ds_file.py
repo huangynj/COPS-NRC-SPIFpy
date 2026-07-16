@@ -29,18 +29,18 @@ else:
 class Fast2DSFile(BinaryFile):
     """
     Class for reading and processing SPEC Fast 2D-S (Type 48) probe data.
-    
+
     Reference: SPEC_OAP_Data_File_Formats_July_2022_Rev_D
-    
+
     File Structure:
         - Base file (.F2DS): Contains image packets (2S) and NULL packets (NL)
         - HK file (.F2DSHK): Contains housekeeping (HK) and mask (MK) packets
-    
+
     Data Block Format (4114 bytes):
         - Timestamp: 16 bytes (8 x uint16: year, month, dow, day, hour, min, sec, ms)
         - Raw Data: 4096 bytes (2048 x uint16 words containing packets)
         - Checksum: 2 bytes (discarded)
-    
+
     Image Packet Format:
         - Word 1: Header "2S" (0x3253 = 12883 decimal)
         - Word 2: NHraw (bits 11-0: word count, bit 12: multi-packet, bit 15: overflow)
@@ -49,12 +49,12 @@ class Fast2DSFile(BinaryFile):
         - Word 5: Slice count (number of 128-pixel slices)
         - Words 6 to 5+N-3: Compressed/uncompressed image data
         - Words 5+N-2 to 5+N: 48-bit timing (only if bit 12 = 0)
-    
+
     Image Data Encoding:
         - 0x4000: Fully shaded slice (128 shaded pixels)
         - 0x7FFF: Next 8 words are uncompressed (8 x 16 bits = 128 pixels)
         - Otherwise: RLE word (bit 14: start slice, bits 13-7: shaded, bits 6-0: clear)
-    
+
     Attributes:
         diodes (int): Number of diodes (128 for 2D-S)
         aux_channels (list): Auxiliary data channels from HK file
@@ -64,7 +64,7 @@ class Fast2DSFile(BinaryFile):
                       with Aaron Bansemer (NSF NCAR) and Parker Morris (SPEC).
         - 2026-01-11: Yongjie Huang, first implementation.
     """
-    
+
     # -------------------------------------------------------------------------
     # Format Constants
     # -------------------------------------------------------------------------
@@ -105,7 +105,7 @@ class Fast2DSFile(BinaryFile):
         self.hk_counts = numpy.array([], dtype=numpy.uint64)
         self.hk_datetimes = numpy.array([], dtype='datetime64[ns]')
         self.hk_tas = numpy.array([], dtype=numpy.float64)
-        
+
         # Data block dtype: 4114 bytes = 16 (timestamp) + 4096 (data) + 2 (checksum)
         self.file_dtype = numpy.dtype([
             ('year', 'u2'),      # Timestamp word 1
@@ -119,7 +119,7 @@ class Fast2DSFile(BinaryFile):
             ('data', '(2048,)u2'),  # Raw data frame (4096 bytes)
             ('discard', 'u2')    # Checksum (not used)
         ])
-        
+
         # Auxiliary channels interpolated from external HK file
         self.aux_channels = [
             'clock_counts',
@@ -136,17 +136,17 @@ class Fast2DSFile(BinaryFile):
     def read(self):
         """ Read the base file and the separate HK file. """
         super().read() # Parent reads the base file into self.data
-        
+
         # Child reads external HK file
         # For .F2DS files, HK is .F2DSHK (filename + 'HK')
         hk_filename = str(self.filename) + 'HK'
-        
+
         if os.path.exists(hk_filename):
             self.hk_data = self._read_external_hk(hk_filename)
         else:
             print(f"Warning: HK file {hk_filename} not found.")
             self.hk_data = None
-            
+
         if self.hk_data is not None:
              self._align_hk_to_frames() # Child aligns TAS to image frames
         else:
@@ -167,12 +167,12 @@ class Fast2DSFile(BinaryFile):
                                 ('ts_hour', '<u2'), ('ts_min', '<u2'), ('ts_sec', '<u2'), ('ts_ms', '<u2'),
                                 ('data', '(82,)<u2'),  # 164 bytes = 82 words
                                 ('checksum', '<u2')])
-        
+
         try:
             # Detect header size based on file size
             file_size = os.path.getsize(filename)
             remainder = file_size % 182
-            
+
             offset = 0
             if remainder == 72:
                 offset = 72
@@ -187,14 +187,14 @@ class Fast2DSFile(BinaryFile):
                 if offset > 0:
                     f.seek(offset)
                 raw = f.read()
-            
+
             # Truncate to multiple of 182 bytes
             read_len = len(raw)
             trunc_rem = read_len % 182
             if trunc_rem != 0:
                  print(f"Warning: HK read content (size {read_len}) not aligned to 182 bytes. Truncating {trunc_rem} bytes.")
                  raw = raw[:-trunc_rem]
-            
+
             raw_hk = numpy.frombuffer(raw, dtype=hk_dtype)
             return raw_hk
         except Exception as e:
@@ -232,7 +232,7 @@ class Fast2DSFile(BinaryFile):
 
         # 1. Convert HK timestamps to unix timestamps (Vectorized)
         data = self.hk_data
-        
+
         # Extract components safely
         years = data['ts_year'].astype(numpy.int32)
         months = data['ts_month'].astype(numpy.int32)
@@ -251,9 +251,9 @@ class Fast2DSFile(BinaryFile):
             (seconds >= 0) & (seconds <= 59) &
             (years >= 2000) & (years <= 2100)
         )
-        
+
         valid_indices = numpy.nonzero(valid_mask)[0]
-        
+
         if len(valid_indices) == 0:
             print("Warning: No valid HK timestamps found.")
             self.tas = numpy.full(len(self.datetimes), numpy.nan)
@@ -281,16 +281,16 @@ class Fast2DSFile(BinaryFile):
             self.user_temp = numpy.full(len(self.datetimes), numpy.nan)
             self.ps_temp = numpy.full(len(self.datetimes), numpy.nan)
             return
-            
+
         # 2. Convert Frame timestamps to nanoseconds (float64)
         frame_ts = self.datetimes.astype(numpy.float64)
-        
+
         # 3. Extract and Interpolate Channels (use only valid HK records)
-        
+
         # --- TAS (True Air Speed) ---
         # TAS is at words 75,76 in the 82-word data section (empirically verified)
         # Word 75 is MSW (17194), Word 76 is LSW (0) -> (w75 << 16) | w76 = 170.00 m/s
-        
+
         hk_words = self.hk_data['data'][valid_indices]
         self.hk_counts = (
             (hk_words[:, 72].astype(numpy.uint64) << 32)
@@ -300,29 +300,29 @@ class Fast2DSFile(BinaryFile):
 
         tas_w75 = hk_words[:, 75]
         tas_w76 = hk_words[:, 76]
-        
+
         # Combine to 32-bit int
         tas_int = (tas_w75.astype(numpy.uint32) << 16) | tas_w76.astype(numpy.uint32)
         hk_tas = tas_int.view(numpy.float32).astype(numpy.float64)
         self.hk_tas = hk_tas
-        
+
         # Filter out invalid TAS values and interpolate
         valid_tas_mask = (hk_tas > 0) & (hk_tas < 500)
-        
+
         if numpy.any(valid_tas_mask):
             self.tas = numpy.interp(frame_ts, hk_ts[valid_tas_mask], hk_tas[valid_tas_mask])
         else:
             print("Warning: No valid TAS values found in HK data.")
             self.tas = numpy.full(len(self.datetimes), numpy.nan)
-        
+
         # --- Temperatures ---
         # DSP Board Temp (Word 17) as 'user_temp' and Power Supply (Word 22) as 'ps_temp'
         # Conversion: C0=-64.8, C1=0.07323
-        
+
         raw_dsp = self.hk_data['data'][valid_indices, 16]
         dsp_temp = raw_dsp * 0.07323 - 64.8
         self.user_temp = numpy.interp(frame_ts, hk_ts, dsp_temp)
-        
+
         # Power Supply Word 22 (Index 21)
         raw_ps = self.hk_data['data'][valid_indices, 21]
         ps_temp = raw_ps * 0.07323 - 64.8
@@ -353,33 +353,33 @@ class Fast2DSFile(BinaryFile):
             processors = os.cpu_count() - 1 if os.cpu_count() > 1 else 1
 
         spiffile.set_start_date(self.start_date.strftime('%Y-%m-%d %H:%M:%S %z'))
-        
+
         # Create Output Groups
         spiffile.create_inst_group(self.name + '-H')
         spiffile.create_inst_group(self.name + '-V')
         spiffile.set_filenames_attr(self.name + '-H', self.filename)
         spiffile.set_filenames_attr(self.name + '-V', self.filename)
-        
+
         # Write buffer info
         spiffile.write_buffer_info(self.start_date, self.datetimes)
-        
+
         # Setup parallel processing
         process_until = len(self.data)
         chunksize = 500
         data_chunk = range(0, process_until)
-        
+
         pbar1 = tqdm(desc='Processing frames', total=process_until, unit='frame')
         pbar2 = tqdm(desc='Writing frames', total=process_until, unit='frame')
-        
+
         futures = []
         max_write_queue = 8
         images_remaining = process_until > 0
         i = 0
-        
+
         tot_h = 0
         tot_v = 0
         t00 = time.time()
-        
+
         with ProcessPoolExecutor(max_workers=processors) as executor:
             while True:
                 while len(futures) <= max_write_queue and images_remaining:
@@ -419,7 +419,7 @@ class Fast2DSFile(BinaryFile):
         if hasattr(spiffile, 'instgrps'):
             self._finalize_particle_times(spiffile, self.name + '-H')
             self._finalize_particle_times(spiffile, self.name + '-V')
-        
+
         print(f'Finished. {tot_h}-H, {tot_v}-V images processed in {time.time()-t00:.2f}s')
 
 
@@ -433,21 +433,21 @@ class Fast2DSFile(BinaryFile):
         """
         h_accum = []
         v_accum = []
-        
+
         # Initialize per-chunk state (not shared with other chunks)
         # We rely on next_start_idx to handle frame boundaries logic locally
         chunk_state = {
             'pending_h': {},
             'pending_v': {},
         }
-        
+
         next_start_idx = 0
         for frame_idx in chunk:
             result = self.process_frame_with_state(frame_idx, chunk_state, start_idx=next_start_idx)
             h_accum.extend(result['h'])
             v_accum.extend(result['v'])
             next_start_idx = result['next_idx']
-            
+
         buffer = {'h': h_accum, 'v': v_accum}
         return self.extract_images(buffer)
 
@@ -459,7 +459,7 @@ class Fast2DSFile(BinaryFile):
         """
         Decodes a single 4096-byte frame (stored as 2048 'u2' words).
         Handles multi-packet particles and cross-frame spanning using Look-Ahead.
-        
+
         Parameters
         ----------
         frame : int
@@ -468,7 +468,7 @@ class Fast2DSFile(BinaryFile):
             Dictionary holding pending multi-packet particle states.
         start_idx : int, optional
             Index to start processing from within the frame (skipping data consumed by previous frame).
-            
+
         Returns
         -------
         dict
@@ -478,7 +478,7 @@ class Fast2DSFile(BinaryFile):
             - 2026-01-11: Yongjie Huang, first implementation.
         """
         record = self.data[frame]['data']
-        
+
         # Look ahead availability
         try:
             record_next = self.data[frame+1]['data']
@@ -486,23 +486,23 @@ class Fast2DSFile(BinaryFile):
         except (IndexError, KeyError):
             record_next = numpy.empty(0, dtype=numpy.uint16)
             next_record_exists = False
-        
+
         if HAS_CYTHON:
              # Delegate to Cython implementation
              return decode_frame(record, record_next, next_record_exists, chunk_state, frame, start_idx)
 
         h_images = []
         v_images = []
-        
+
         idx = start_idx
         limit = len(record) # Limit for processing loop
         reach_record_end = False
         next_start_idx = 0
-        
+
         # Main particle scanning loop
         while idx < limit:
             word = record[idx]
-            
+
             # Check for '2S' image packet sync word (0x3253 = 12883)
             if word == self.SYNC_2S:
                 # Parse 5-word header: [2S, NHraw, NVraw, PID, Slices]
@@ -510,7 +510,7 @@ class Fast2DSFile(BinaryFile):
                     nh_temp = record[idx+1] & 0x0FFF
                     nv_temp = record[idx+2] & 0x0FFF
                     n_temp = nh_temp if nh_temp > 0 else nv_temp
-                    
+
                     if idx + 5 + n_temp > limit:
                         reach_record_end = True
                 else:
@@ -522,27 +522,27 @@ class Fast2DSFile(BinaryFile):
                         record = numpy.concatenate((record, record_next))
                         # Note: 'limit' still refers to original frame boundary
                     else:
-                        break  # EOF 
+                        break  # EOF
 
                 # Decode Header
                 nh_raw = record[idx+1]
                 nv_raw = record[idx+2]
                 pid = record[idx+3]
                 slices = record[idx+4]
-                
+
                 # Extract word count from bits 11-0 (mask 0x0FFF = 4095)
                 nh = nh_raw & 0x0FFF
                 nv = nv_raw & 0x0FFF
                 n_words = nh if nh > 0 else nv  # One of NH/NV is always 0
-                
+
                 if n_words == 0:
                     idx += 1
                     continue
-                
+
                 is_horiz = (nh > 0)
                 # Bit 12 (0x1000): multi-packet flag (1 = more packets follow, no timing words)
                 is_multi_packet = ((nh_raw if is_horiz else nv_raw) & 0x1000) >> 12
-                
+
                 data_start = idx + 5
                 data_end = data_start + n_words
 
@@ -556,17 +556,17 @@ class Fast2DSFile(BinaryFile):
                         'packet skipped.'
                     )
                     break
-                
+
                 # Packet data
                 full_packet_data = record[data_start:data_end]
-                
+
                 # --- Decoding Logic ---
-                
+
                 pending = chunk_state['pending_h'] if is_horiz else chunk_state['pending_v']
                 if pid not in pending:
                     pending[pid] = {'img_decomp': [], 'slice_decomp': [], 'non_compressed': 0}
                 state = pending[pid]
-                
+
                 # Process Data
                 # Per spec: if bit 12 set (multi-packet), NO timing words at end
                 # Otherwise: last 3 words are 48-bit timing
@@ -576,18 +576,18 @@ class Fast2DSFile(BinaryFile):
                     payload_data = full_packet_data
                 elif len(full_packet_data) >= 3:
                     # Single/final packet: extract 48-bit timing from last 3 words
-                    timing = ((int(full_packet_data[-1]) << 32) | 
-                              (int(full_packet_data[-2]) << 16) | 
+                    timing = ((int(full_packet_data[-1]) << 32) |
+                              (int(full_packet_data[-2]) << 16) |
                               (int(full_packet_data[-3])))
                     payload_data = full_packet_data[:-3]
                 else:
                     timing = 0  # Shouldn't happen but handle gracefully
                     payload_data = full_packet_data
-                
+
                 # Decode image data (RLE compressed or raw bitmap)
                 for val in payload_data:
                     val = int(val)
-                    
+
                     if state['non_compressed'] > 0:
                         # Raw bitmap mode: convert 16-bit word to 16 pixels
                         # Pixel format: 1=clear, 0=shaded (inverted at final output)
@@ -600,7 +600,7 @@ class Fast2DSFile(BinaryFile):
                                 state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
                             state['img_decomp'].extend(state['slice_decomp'])
                             state['slice_decomp'] = []
-                            
+
                     elif val == self.RLE_UNCOMPRESSED:  # 0x7FFF
                         # Start of uncompressed slice: next 8 words are raw 128-bit bitmap
                         if len(state['slice_decomp']) > 0:
@@ -609,7 +609,7 @@ class Fast2DSFile(BinaryFile):
                             state['img_decomp'].extend(state['slice_decomp'])
                             state['slice_decomp'] = []
                         state['non_compressed'] = 8  # Next 8 words are raw bitmap
-                        
+
                     elif val == self.RLE_FULL_SHADED:  # 0x4000
                         # Fully shaded slice: 128 shaded pixels
                         if len(state['slice_decomp']) > 0:
@@ -618,7 +618,7 @@ class Fast2DSFile(BinaryFile):
                             state['img_decomp'].extend(state['slice_decomp'])
                             state['slice_decomp'] = []
                         state['img_decomp'].extend([1] * 128)  # All shaded
-                        
+
                     else:
                         # RLE encoded word:
                         #   bit 15: always 0 for RLE
@@ -628,7 +628,7 @@ class Fast2DSFile(BinaryFile):
                         startslice = (val >> 14) & 1
                         num_shaded = (val >> 7) & 0x7F   # bits 13-7
                         num_clear = val & 0x7F           # bits 6-0
-                        
+
                         if startslice == 1 and len(state['slice_decomp']) > 0:
                             # Start of new slice - finalize previous
                                 if len(state['slice_decomp']) % 128 > 0:
@@ -638,7 +638,7 @@ class Fast2DSFile(BinaryFile):
                         # Append clear pixels then shaded pixels
                         state['slice_decomp'].extend([0] * num_clear)
                         state['slice_decomp'].extend([1] * num_shaded)
-                
+
 
                 # Finalize Image
                 if not is_multi_packet:
@@ -646,11 +646,11 @@ class Fast2DSFile(BinaryFile):
                         if len(state['slice_decomp']) % 128 > 0:
                             state['slice_decomp'].extend([0] * (128 - (len(state['slice_decomp']) % 128)))
                         state['img_decomp'].extend(state['slice_decomp'])
-                    
+
                     final_buffer = bytearray(state['img_decomp'])
                     final_data = numpy.frombuffer(final_buffer, dtype=numpy.uint8)
                     numpy.bitwise_xor(final_data, 1, out=final_data)
-                    
+
                     img_result = {
                         'id': pid,
                         'slices': slices,
@@ -668,15 +668,15 @@ class Fast2DSFile(BinaryFile):
                 if reach_record_end:
                     next_start_idx = data_end - limit
                     break
-                    
+
                 idx = data_end
-            
+
             elif word == self.SYNC_NL:  # 0x4C4E: NULL packet (FIFO flush/padding)
                 idx += 1
             else:
                 # Unknown word - skip
                 idx += 1
-                
+
         return {'h': h_images, 'v': v_images, 'next_idx': next_start_idx}
 
 
@@ -1247,25 +1247,25 @@ class Fast2DSFile(BinaryFile):
         frame_seconds = self._seconds_from_start(self.datetimes).astype(
             numpy.float64
         )
-        
+
         # Process each channel with vectorization
         for channel_name, imgs_obj in [('h', h_imgs), ('v', v_imgs)]:
             img_list = buffer.get(channel_name, [])
             if not img_list:
                 continue
-                
+
             # 1. First pass: Collect all data into lists
             raw_data_list = []
             timings_list = []
             buf_indices_list = []
-            
+
             # Filter valid images and extract data
             for img_dict in img_list:
                 if 'data' in img_dict and len(img_dict['data']) > 0:
                      raw_data_list.append(img_dict)
                      timings_list.append(img_dict.get('time', 0))
                      buf_indices_list.append(img_dict.get('buffer_index', 0))
-            
+
             if not raw_data_list:
                 continue
 
@@ -1286,12 +1286,12 @@ class Fast2DSFile(BinaryFile):
                 self.TIMING_INVALID_BUFFER,
             )
             sec_array, ns_array = self._seconds_to_sec_ns(particle_seconds)
-            
+
             # 3. Populate Images object
             for i, img_dict in enumerate(raw_data_list):
                 try:
                     image_data = numpy.ascontiguousarray(img_dict['data'], dtype=numpy.uint8)
-                    
+
                     imgs_obj.image.append(image_data)
                     imgs_obj.ns.append(int(ns_array[i]))
                     imgs_obj.sec.append(int(sec_array[i]))
@@ -1300,10 +1300,10 @@ class Fast2DSFile(BinaryFile):
                     imgs_obj.timing_quality.append(
                         int(provisional_quality[i])
                     )
-                    
+
                     buf_idx = buf_indices_list[i]
                     imgs_obj.buffer_index.append(buf_idx)
-                    
+
                     for channel in ('tas', 'user_temp', 'ps_temp'):
                         values = getattr(self, channel, None)
                         value = (
@@ -1316,8 +1316,8 @@ class Fast2DSFile(BinaryFile):
                             else numpy.nan
                         )
                         getattr(imgs_obj, channel).append(value)
-                        
+
                 except (ValueError, TypeError):
                     pass
-        
+
         return h_imgs, v_imgs
