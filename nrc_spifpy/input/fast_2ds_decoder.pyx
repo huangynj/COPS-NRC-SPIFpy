@@ -5,7 +5,7 @@ cimport cython
 
 # Format Constants
 cdef unsigned short SYNC_2S = 12883           # 0x3253
-cdef unsigned short SYNC_NL = 0x4C4E          # 0x4C4E
+cdef unsigned short SYNC_NL = 0x4E4C          # disk bytes 0x4C 0x4E
 cdef unsigned short RLE_FULL_SHADED = 0x4000  # 0x4000
 cdef unsigned short RLE_UNCOMPRESSED = 0x7FFF # 0x7FFF
 

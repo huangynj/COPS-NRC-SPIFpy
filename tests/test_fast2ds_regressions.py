@@ -63,6 +63,16 @@ class TestFast2DSRegressions(unittest.TestCase):
             implementations.append(('cython', True))
         return implementations
 
+    def test_packet_markers_match_little_endian_disk_bytes(self):
+        self.assertEqual(
+            Fast2DSFile.SYNC_2S,
+            int.from_bytes(bytes.fromhex('53 32'), byteorder='little'),
+        )
+        self.assertEqual(
+            Fast2DSFile.SYNC_NL,
+            int.from_bytes(bytes.fromhex('4C 4E'), byteorder='little'),
+        )
+
     def test_split_header_and_oversized_packet_are_safe(self):
         split = self.make_file(2)
         split.data[0]['data'][2046:2048] = [split.SYNC_2S, 4]

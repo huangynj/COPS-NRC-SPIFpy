@@ -20,12 +20,6 @@ except ImportError:
 if os.environ.get('FORCE_PYTHON_F2DS') == '1':
     HAS_CYTHON = False
 
-if HAS_CYTHON:
-    print("Using cythonized decoder")
-else:
-    print("Using pure python decoder")
-
-
 class Fast2DSFile(BinaryFile):
     """
     Class for reading and processing SPEC Fast 2D-S (Type 48) probe data.
@@ -69,7 +63,7 @@ class Fast2DSFile(BinaryFile):
     # Format Constants
     # -------------------------------------------------------------------------
     SYNC_2S = 12883           # 0x3253: Image packet header
-    SYNC_NL = 0x4C4E          # NULL packet header
+    SYNC_NL = 0x4E4C          # NULL packet header (disk bytes 4C 4E)
     RLE_FULL_SHADED = 0x4000  # Fully shaded slice (128 pixels)
     RLE_UNCOMPRESSED = 0x7FFF # Next 8 words are raw bitmap
     TIMING_MODULUS = 1 << 48  # 2**48
@@ -349,6 +343,11 @@ class Fast2DSFile(BinaryFile):
         History:
             - 2026-01-11: Yongjie Huang, first implementation.
         """
+        if HAS_CYTHON:
+            print("Using cythonized decoder")
+        else:
+            print("Using pure python decoder")
+
         if processors is None:
             processors = os.cpu_count() - 1 if os.cpu_count() > 1 else 1
 
@@ -671,7 +670,7 @@ class Fast2DSFile(BinaryFile):
 
                 idx = data_end
 
-            elif word == self.SYNC_NL:  # 0x4C4E: NULL packet (FIFO flush/padding)
+            elif word == self.SYNC_NL:  # 0x4E4C: NULL packet (FIFO flush/padding)
                 idx += 1
             else:
                 # Unknown word - skip
