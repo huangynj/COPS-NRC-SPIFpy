@@ -38,6 +38,12 @@ class SPECFile(BinaryFile):
         Name of current instrument.
     """
     syncword = numpy.array([3] * 128)
+    TIMING_ANCHOR_WINDOW_SECONDS = 300.0
+    COUNTER_GAP_TOLERANCE_SECONDS = 10.0
+    AUX_DTYPES = {
+        'tas': 'f4',
+        'clock_counts': 'u8',
+    }
 
     def __init__(self, filename, inst_name, resolution):
         super().__init__(filename, inst_name, resolution)
@@ -200,10 +206,140 @@ class SPECFile(BinaryFile):
 
         self.calc_image_times(inst_groups, spiffile)
 
+    @staticmethod
+    def _unwrap_counter(counts, modulus):
+        """Return elapsed counter ticks with hardware rollovers removed."""
+        counts = numpy.asarray(
+            numpy.ma.filled(counts, 0), dtype=numpy.uint64
+        )
+        if len(counts) == 0:
+            return numpy.array([], dtype=numpy.uint64)
+
+        # Modular subtraction handles 32- and 48-bit rollovers without
+        # detecting or treating the rollover locations as timing breaks.
+        delta = numpy.mod(
+            numpy.diff(counts.astype(numpy.int64)), modulus
+        ).astype(numpy.uint64)
+        return numpy.concatenate((
+            numpy.array([0], dtype=numpy.uint64),
+            numpy.cumsum(delta, dtype=numpy.uint64),
+        ))
+
+    @staticmethod
+    def _fill_missing_tas(tas):
+        """Interpolate missing TAS values, or return None if all are invalid."""
+        tas = numpy.asarray(
+            numpy.ma.filled(tas, numpy.nan), dtype=numpy.float64
+        ).copy()
+        valid = numpy.isfinite(tas) & (tas > 0)
+        if not numpy.any(valid):
+            return None
+        if not numpy.all(valid):
+            missing = numpy.flatnonzero(~valid)
+            tas[missing] = numpy.interp(
+                missing, numpy.flatnonzero(valid), tas[valid]
+            )
+        return tas
+
+    def _smoothed_buffer_offset(self, elapsed_time, buffer_time):
+        """Return a slowly varying UTC offset from end-of-buffer anchors."""
+        anchor = numpy.flatnonzero(numpy.concatenate((
+            numpy.diff(buffer_time) != 0,
+            [True],
+        )))
+        residual = buffer_time[anchor] - elapsed_time[anchor]
+        window = numpy.floor(
+            (buffer_time[anchor] - buffer_time[anchor][0])
+            / self.TIMING_ANCHOR_WINDOW_SECONDS
+        ).astype(numpy.int64)
+
+        centers = []
+        offsets = []
+        for window_id in numpy.unique(window):
+            selected = window == window_id
+            centers.append(numpy.median(elapsed_time[anchor][selected]))
+            offsets.append(numpy.median(residual[selected]))
+
+        centers = numpy.asarray(centers, dtype=numpy.float64)
+        offsets = numpy.asarray(offsets, dtype=numpy.float64)
+        increasing = numpy.concatenate(([True], numpy.diff(centers) > 0))
+        return numpy.interp(
+            elapsed_time, centers[increasing], offsets[increasing]
+        )
+
+    def _calculate_image_times(self, counts, tas, buffer_time):
+        """Calculate counter-based image times anchored to buffer timestamps."""
+        counts = numpy.asarray(counts)
+        buffer_time = numpy.asarray(buffer_time, dtype=numpy.float64)
+        tas = self._fill_missing_tas(tas)
+
+        if counts.shape != buffer_time.shape:
+            raise ValueError('counts and buffer_time must have the same shape')
+        if len(counts) == 0:
+            return buffer_time.copy()
+        if tas is None:
+            return buffer_time.copy()
+        if tas.shape != counts.shape:
+            raise ValueError('counts and tas must have the same shape')
+
+        modulus = 1 << (48 if self.name == 'HVPS4' else 32)
+        elapsed_count = self._unwrap_counter(counts, modulus)
+        delta_count = numpy.diff(
+            elapsed_count, prepend=elapsed_count[0]
+        ).astype(numpy.float64)
+
+        # One count represents one resolution element along the flight path.
+        delta_time = delta_count * self.resolution * 1.0e-6 / tas
+        delta_buffer = numpy.diff(
+            buffer_time, prepend=buffer_time[0]
+        )
+
+        # A normal rollover has a small modular delta. Only split the timeline
+        # for a real acquisition gap, backwards buffer time, or implausibly
+        # large counter jump (for example, a counter reset).
+        discontinuity = (
+            (delta_buffer > 200.0)
+            | (delta_buffer < 0.0)
+            | (
+                delta_time
+                > numpy.maximum(delta_buffer, 0.0)
+                + self.COUNTER_GAP_TOLERANCE_SECONDS
+            )
+        )
+        block_starts = numpy.flatnonzero(discontinuity)
+        block_starts = block_starts[block_starts > 0]
+
+        image_time = buffer_time.copy()
+        for block in numpy.split(numpy.arange(len(counts)), block_starts):
+            block_delta = delta_time[block].copy()
+            block_delta[0] = 0.0
+            elapsed_time = numpy.cumsum(block_delta)
+            block_buffer_time = buffer_time[block]
+            offset = self._smoothed_buffer_offset(
+                elapsed_time, block_buffer_time
+            )
+            image_time[block] = elapsed_time + offset
+
+        return image_time
+
+    @staticmethod
+    def _split_seconds(image_time):
+        """Split relative seconds into normalized integer seconds and ns."""
+        seconds = numpy.floor(image_time).astype(numpy.int64)
+        nanoseconds = numpy.rint(
+            (image_time - seconds) * 1.0e9
+        ).astype(numpy.int64)
+        carry = nanoseconds >= 1_000_000_000
+        seconds[carry] += 1
+        nanoseconds[carry] -= 1_000_000_000
+        return seconds, nanoseconds
+
     def calc_image_times(self, inst_groups, spiffile):
-        """
-        Recalucates image times based on procedure implemented by Aaron Bansemer
-        in SODA2 (see file specnewtime.pro).
+        """Recalculate image times from the probe counter and buffer UTC.
+
+        Counter rollover is handled by modular subtraction. Buffer timestamps
+        anchor the counter-derived elapsed time and separate true acquisition
+        gaps or counter resets.
 
         Parameters
         ----------
@@ -212,96 +348,39 @@ class SPECFile(BinaryFile):
         spiffile : SPIFFile object
             SPIFFile object of current SPIF NetCDF output file
 
+        History:
+            - 2026-07-15: Yongjie Huang, replaced explicit rollover segments
+                          with modular counter unwrapping and smoothed buffer
+                          UTC anchoring.
+            - 2022-10-28: Kenny Bala, first implementation based on the SODA2
+                          ``specnewtime.pro`` procedure.
         """
 
-        # Define needed parameters for recomputing times
-        times = numpy.array(self.datetimes, dtype='datetime64[ns]') - numpy.datetime64(self.start_date)
-        secs = times.astype('timedelta64[s]')
-        ns = times - secs
-        datetimes = secs.astype(float) + ns.astype(float) * 1e-9
+        frame_time = (
+            numpy.asarray(self.datetimes, dtype='datetime64[ns]')
+            - numpy.datetime64(self.start_date)
+        ) / numpy.timedelta64(1, 's')
 
         # Iterate over instrument groups in current file
-        for i, inst_group in enumerate(inst_groups):
-
-            # Read relevant parameters from spiffile
-            buffer_indx = spiffile.instgrps[inst_group]['core']['buffer_index'][:]
+        for inst_group in inst_groups:
+            core = spiffile.instgrps[inst_group]['core']
+            buffer_indx = numpy.asarray(
+                core['buffer_index'][:], dtype=numpy.int64
+            )
             try:
-                tas = spiffile.instgrps[inst_group]['core']['tas'][:]
-
-                # Fill NaN using numpy's interp, Yongjie Huang, 2024-08-17.
-                mask = numpy.isnan(tas)
-                tas[mask] = numpy.interp(numpy.flatnonzero(mask), numpy.flatnonzero(~mask), tas[~mask])
-
+                tas = core['tas'][:]
             except IndexError:
                 continue
-            counts = spiffile.instgrps[inst_group]['core']['clock_counts'][:]
-
-            # Get timestamp for each image corresponding their parent buffer
-            buffer_time = datetimes[buffer_indx]
-
-            # Calculate delta between counter and buffer
-            delta_count = numpy.diff(counts, prepend=counts[0])
-            delta_buffer = numpy.diff(buffer_time, prepend=buffer_time[0])
-
-            # Find places where counter rolled over -- should happen every
-            # 5.5 mins at 150 m/s
-            # Checks both for negative counter value, and large gap in buffer time
-            rollover = numpy.where((delta_count < 0) | (delta_buffer > 200))[0]
-
-            # Add rollover max time to get positive delta times
-            # HVPS4 has 48 bit counter, all other probes have 32 bit counter
-            if self.name == 'HVPS4':
-                delta_count[delta_count < 0] += 2 ** 48
-            else:
-                delta_count[delta_count < 0] += 2 ** 32
-
-            # Convert delta counter to delta time based on airspeed
-            delta_time = delta_count * self.resolution / tas * 1e-6
-
-            # Calculate times at the end of each buffer -- this is used below
-            # to match buffer times to the partcile time at the end of each
-            # buffer
-            itimematch = numpy.where(delta_buffer > 0)[0] - 1
-
-            # Use buffer time as best first guess, should be no drift or rollovers
-            newtime = buffer_time
-            elapsed_time = numpy.zeros(len(newtime))
-
-            # Set rollover indexes for use in loop below. If there were no
-            # rollovers, only value needed is the end of the array. Otherwise
-            # Each rollover location plus the end of the array is needed.
-            if len(rollover) > 0:
-                rollover = numpy.append(rollover, [len(newtime)])
-            else:
-                rollover = [len(newtime)]
-
-            # Loop over all rollover locations to calculate best time within
-            # each period.
-            istart = 0
-            for ro in rollover:
-                istop = ro - 1
-                # Calculate total elapsed counter time in each rollover period
-                elapsed_time[istart: istop] = numpy.cumsum(delta_time[istart: istop])
-
-                # Find buffer boundaries that fall within rollover period
-                matches = numpy.where((itimematch > istart) & (itimematch < istop))[0]
-
-                # Find median difference between buffer boundaries and
-                # image counter elapsed time within rollover period
-                # and add this to elapsed time to calculate new image time
-                offset = numpy.median(buffer_time[itimematch[matches]] - elapsed_time[itimematch[matches]])
-                newtime[istart: istop] = elapsed_time[istart: istop] + offset
-                istart = ro
-
-            # Recalculate seconds and ns from new time
-            epoch_time = numpy.modf(newtime)
-            secs = epoch_time[1]
-            ns = epoch_time[0] * 1e9
+            counts = core['clock_counts'][:]
+            buffer_time = frame_time[buffer_indx]
+            image_time = self._calculate_image_times(
+                counts, tas, buffer_time
+            )
+            secs, ns = self._split_seconds(image_time)
 
             # Save new time to file
-            grp = spiffile.instgrps[inst_group]['core']
-            spiffile.write_variable(grp, 'image_sec', secs)
-            spiffile.write_variable(grp, 'image_ns', ns)
+            spiffile.write_variable(core, 'image_sec', secs)
+            spiffile.write_variable(core, 'image_ns', ns)
 
     def partial_write(self, spiffile, h_p, v_p, h_p150=None, v_p150=None):
         """ Called each time number of unsaved processed images exceeds
@@ -340,7 +419,9 @@ class SPECFile(BinaryFile):
     def _partial_write(self, spiffile, images, suffix=''):
         if len(images) > 0:
             images.conv_to_array(self.diodes)
-            spiffile.write_images(self.name + suffix, images)
+            spiffile.write_images_with_extra_aux_dtypes(
+                self.name + suffix, images, self.AUX_DTYPES
+            )
 
     def process_frames(self, frames):
         h_p = Images(self.aux_channels)
