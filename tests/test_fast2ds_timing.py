@@ -130,5 +130,24 @@ class TestFast2DSTiming(unittest.TestCase):
         )
         numpy.testing.assert_array_equal(quality, [2, 2, 2, 2])
 
+    def test_backwards_replacement_rechecks_adjacent_boundaries(self):
+        particle_seconds = numpy.array([1.0, 3.0, 2.0, 4.0])
+        timing_quality = numpy.ones(4, dtype=numpy.uint8)
+        fallback_seconds = numpy.array([0.0, 0.5, 1.5, 4.0])
+        fallback_quality = numpy.full(4, 2, dtype=numpy.uint8)
+
+        self.f2ds._replace_backwards_times(
+            particle_seconds,
+            timing_quality,
+            fallback_seconds,
+            fallback_quality,
+        )
+
+        numpy.testing.assert_allclose(
+            particle_seconds, [0.0, 0.5, 1.5, 4.0]
+        )
+        numpy.testing.assert_array_equal(timing_quality, [2, 2, 2, 1])
+        self.assertTrue(numpy.all(numpy.diff(particle_seconds) >= 0.0))
+
 if __name__ == "__main__":
     unittest.main()

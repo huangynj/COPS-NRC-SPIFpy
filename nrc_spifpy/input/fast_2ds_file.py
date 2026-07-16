@@ -764,18 +764,39 @@ class Fast2DSFile(BinaryFile):
         fallback_seconds,
         fallback_quality,
     ):
-        """Replace both particles around a backwards timestamp jump."""
-        backwards = numpy.nonzero(
-            numpy.diff(particle_seconds) < -1.0e-6
-        )[0]
-        if len(backwards) == 0:
-            return
+        """Replace backwards timestamp pairs until adjacent boundaries are valid.
 
-        affected = numpy.unique(numpy.concatenate((
-            backwards, backwards + 1
-        )))
-        particle_seconds[affected] = fallback_seconds[affected]
-        timing_quality[affected] = fallback_quality[affected]
+        Replacing a pair can expose a new backwards jump between a fallback
+        value and its unchanged neighbor. Recheck after each pair replacement
+        until the timeline is nondecreasing or the fixed fallback cannot make
+        further progress.
+        """
+        pending = numpy.nonzero(
+            numpy.diff(particle_seconds) < -1.0e-6
+        )[0].tolist()
+        while pending:
+            index = pending.pop()
+            if (
+                particle_seconds[index + 1] - particle_seconds[index]
+                >= -1.0e-6
+            ):
+                continue
+
+            before = particle_seconds[index:index + 2].copy()
+            particle_seconds[index:index + 2] = fallback_seconds[index:index + 2]
+            timing_quality[index:index + 2] = fallback_quality[index:index + 2]
+            if numpy.array_equal(before, particle_seconds[index:index + 2]):
+                continue
+
+            # Only the neighboring edges can have become invalid. Checking
+            # those locally avoids repeatedly scanning multi-million particles.
+            for neighbor in (index - 1, index + 1):
+                if (
+                    0 <= neighbor < len(particle_seconds) - 1
+                    and particle_seconds[neighbor + 1]
+                    - particle_seconds[neighbor] < -1.0e-6
+                ):
+                    pending.append(neighbor)
 
     def _counter_segments(self, counts, seconds):
         """Split counter records at resets or backwards acquisition time jumps."""
