@@ -55,7 +55,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Kenny Bala",
     author_email="Kliti.Bala@nrc-cnrc.gc.ca",
-    url="https://github.com/nrc-cnrc/NRC-SPIFpy",
+    url="https://github.com/huangynj/COPS-NRC-SPIFpy",
     install_requires=get_requirements("requirements/requirements.txt"),
     license="MIT",
     keywords="SPIF, Converter",
