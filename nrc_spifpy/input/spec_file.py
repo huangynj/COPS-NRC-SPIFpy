@@ -44,6 +44,20 @@ class SPECFile(BinaryFile):
         'tas': 'f4',
         'clock_counts': 'u8',
     }
+    AUX_ATTRS = {
+        'tas': {
+            'long_name': 'True airspeed as recorded by probe',
+            'units': 'm/s',
+        },
+        'clock_counts': {
+            'long_name': 'Probe clock count at the last image slice',
+            'units': '1',
+            'comment': (
+                'Free-running counter stored modulo 2^32 for 2DS and HVPS, '
+                'or modulo 2^48 for HVPS4.'
+            ),
+        },
+    }
 
     def __init__(self, filename, inst_name, resolution):
         super().__init__(filename, inst_name, resolution)
@@ -420,7 +434,10 @@ class SPECFile(BinaryFile):
         if len(images) > 0:
             images.conv_to_array(self.diodes)
             spiffile.write_images_with_extra_aux_dtypes(
-                self.name + suffix, images, self.AUX_DTYPES
+                self.name + suffix,
+                images,
+                self.AUX_DTYPES,
+                self.AUX_ATTRS,
             )
 
     def process_frames(self, frames):

@@ -125,7 +125,7 @@ class TestSPECTiming(unittest.TestCase):
 
         numpy.testing.assert_array_equal(image_time, buffer_time)
 
-    def test_partial_write_preserves_full_counter_precision(self):
+    def test_partial_write_preserves_counter_and_sets_aux_metadata(self):
         config = configparser.ConfigParser()
         config.read(os.path.join(
             os.path.dirname(__file__),
@@ -149,10 +149,26 @@ class TestSPECTiming(unittest.TestCase):
             try:
                 output.create_inst_group('2DS-H')
                 self.spec._partial_write(output, images, '-H')
-                counts = output.instgrps['2DS-H']['core']['clock_counts']
+                core = output.instgrps['2DS-H']['core']
+                tas = core['tas']
+                counts = core['clock_counts']
 
+                self.assertEqual(
+                    tas.long_name, 'True airspeed as recorded by probe'
+                )
+                self.assertEqual(tas.units, 'm/s')
                 self.assertEqual(counts.dtype, numpy.dtype('uint64'))
                 self.assertEqual(int(counts[0]), (1 << 48) - 1)
+                self.assertEqual(
+                    counts.long_name,
+                    'Probe clock count at the last image slice',
+                )
+                self.assertEqual(counts.units, '1')
+                self.assertEqual(
+                    counts.comment,
+                    'Free-running counter stored modulo 2^32 for 2DS and HVPS, '
+                    'or modulo 2^48 for HVPS4.',
+                )
             finally:
                 output.close()
 

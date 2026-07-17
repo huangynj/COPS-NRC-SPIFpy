@@ -243,13 +243,53 @@ class TestFast2DSRegressions(unittest.TestCase):
             try:
                 fast_2ds.process_file(output, processors=1)
                 core = output.instgrps['F2DS-H']['core']
+                self.assertEqual(
+                    core['tas'].long_name,
+                    'True airspeed interpolated from external housekeeping '
+                    'records',
+                )
+                self.assertEqual(core['tas'].units, 'm/s')
+                self.assertEqual(
+                    core['tas'].comment,
+                    'Housekeeping TAS interpolated to image-buffer timestamps '
+                    'and copied to each particle.',
+                )
+                self.assertEqual(
+                    core['user_temp'].long_name,
+                    'DSP board temperature interpolated from external '
+                    'housekeeping records',
+                )
+                self.assertEqual(core['user_temp'].units, 'degree_Celsius')
+                self.assertEqual(
+                    core['ps_temp'].long_name,
+                    'Power supply temperature interpolated from external '
+                    'housekeeping records',
+                )
+                self.assertEqual(core['ps_temp'].units, 'degree_Celsius')
                 self.assertEqual(core['clock_counts'].dtype, numpy.dtype('uint64'))
                 self.assertEqual(int(core['clock_counts'][0]), particle_count)
+                self.assertEqual(
+                    core['clock_counts'].long_name,
+                    '48-bit probe count at the last image slice',
+                )
+                self.assertEqual(core['clock_counts'].units, '1')
+                self.assertEqual(
+                    core['clock_counts'].comment,
+                    'Free-running counter stored modulo 2^48.',
+                )
                 self.assertEqual(int(core['image_sec'][0]), 0)
                 self.assertAlmostEqual(
                     int(core['image_ns'][0]), 250_000_000, delta=1
                 )
                 self.assertEqual(int(core['timing_quality'][0]), 1)
+                self.assertEqual(
+                    core['timing_quality'].long_name,
+                    'particle timing source and quality',
+                )
+                numpy.testing.assert_array_equal(
+                    core['timing_quality'].flag_values,
+                    [1, 2, 3, 4],
+                )
                 self.assertEqual(
                     core['timing_quality'].flag_meanings,
                     'hk_anchored_probe_counter '

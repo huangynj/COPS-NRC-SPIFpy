@@ -81,6 +81,52 @@ class Fast2DSFile(BinaryFile):
         'ps_temp': 'f4',
         'timing_quality': 'u1',
     }
+    AUX_ATTRS = {
+        'clock_counts': {
+            'long_name': '48-bit probe count at the last image slice',
+            'units': '1',
+            'comment': 'Free-running counter stored modulo 2^48.',
+        },
+        'tas': {
+            'long_name': (
+                'True airspeed interpolated from external housekeeping records'
+            ),
+            'units': 'm/s',
+            'comment': (
+                'Housekeeping TAS interpolated to image-buffer timestamps and '
+                'copied to each particle.'
+            ),
+        },
+        'user_temp': {
+            'long_name': (
+                'DSP board temperature interpolated from external '
+                'housekeeping records'
+            ),
+            'units': 'degree_Celsius',
+        },
+        'ps_temp': {
+            'long_name': (
+                'Power supply temperature interpolated from external '
+                'housekeeping records'
+            ),
+            'units': 'degree_Celsius',
+        },
+        'timing_quality': {
+            'long_name': 'particle timing source and quality',
+            'flag_values': numpy.array([
+                TIMING_HK_COUNTER,
+                TIMING_BUFFER_COUNTER,
+                TIMING_BUFFER_ONLY,
+                TIMING_INVALID_BUFFER,
+            ], dtype=numpy.uint8),
+            'flag_meanings': (
+                'hk_anchored_probe_counter '
+                'buffer_anchored_probe_counter '
+                'buffer_timestamp '
+                'invalid_buffer_index'
+            ),
+        },
+    }
 
     # =========================================================================
     # Phase 1: Initialization
@@ -333,7 +379,7 @@ class Fast2DSFile(BinaryFile):
         if writer is None:
             spiffile.write_images(inst_name, images)
         else:
-            writer(inst_name, images, self.AUX_DTYPES)
+            writer(inst_name, images, self.AUX_DTYPES, self.AUX_ATTRS)
 
     def process_file(self, spiffile, processors=None):
         """
@@ -1193,25 +1239,12 @@ class Fast2DSFile(BinaryFile):
         coregrp['image_ns'][:] = ns
         if 'timing_quality' in coregrp.variables:
             coregrp['timing_quality'][:] = quality
-            coregrp['timing_quality'].setncatts({
-                'long_name': 'particle timing source and quality',
-                'flag_values': numpy.array([
-                    self.TIMING_HK_COUNTER,
-                    self.TIMING_BUFFER_COUNTER,
-                    self.TIMING_BUFFER_ONLY,
-                    self.TIMING_INVALID_BUFFER,
-                ], dtype=numpy.uint8),
-                'flag_meanings': (
-                    'hk_anchored_probe_counter '
-                    'buffer_anchored_probe_counter '
-                    'buffer_timestamp invalid_buffer_index'
-                ),
-            })
-        coregrp['clock_counts'].setncatts({
-            'long_name': '48-bit probe count at the last image slice',
-            'units': '1',
-            'comment': 'Free-running counter stored modulo 2^48.',
-        })
+            coregrp['timing_quality'].setncatts(
+                dict(self.AUX_ATTRS['timing_quality'])
+            )
+        coregrp['clock_counts'].setncatts(
+            dict(self.AUX_ATTRS['clock_counts'])
+        )
         coregrp['image_sec'].setncattr(
             'ancillary_variables', 'timing_quality clock_counts'
         )
