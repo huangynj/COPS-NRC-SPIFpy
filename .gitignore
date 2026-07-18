@@ -16,3 +16,5 @@ base*
 spifpy.egg-info/**
 nrc_spifpy.egg-info/
 venv/**
+build/
+tmp/
