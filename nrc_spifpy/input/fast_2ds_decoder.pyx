@@ -28,7 +28,7 @@ def decode_frame(
         int next_start_idx = 0
         int i, j, k
         unsigned short word, nh_raw, nv_raw, pid, slices
-        unsigned short nh, nv, n_words, is_multi_packet
+        unsigned short nh, nv, n_words, is_multi_packet, overload_flag
         int data_start, data_end, words_needed
         unsigned long long timing = 0
         unsigned short val
@@ -90,6 +90,7 @@ def decode_frame(
 
             is_horiz = (nh > 0)
             is_multi_packet = ((nh_raw if is_horiz else nv_raw) & 0x1000) >> 12
+            overload_flag = ((nh_raw if is_horiz else nv_raw) & 0x8000) >> 15
 
             data_start = idx + 5
             data_end = data_start + n_words
@@ -247,6 +248,7 @@ def decode_frame(
                      'time': timing,
                      'data': final_data,
                      'buffer_index': frame_idx,
+                     'overload_flag': overload_flag,
                  }
 
                  if is_horiz:

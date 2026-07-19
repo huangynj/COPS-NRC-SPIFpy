@@ -43,6 +43,7 @@ class SPECFile(BinaryFile):
     AUX_DTYPES = {
         'tas': 'f4',
         'clock_counts': 'u8',
+        'overload_flag': 'u1',
     }
     AUX_ATTRS = {
         'tas': {
@@ -55,6 +56,15 @@ class SPECFile(BinaryFile):
             'comment': (
                 'Free-running counter stored modulo 2^32 for 2DS and HVPS, '
                 'or modulo 2^48 for HVPS4.'
+            ),
+        },
+        'overload_flag': {
+            'long_name': 'Probe particle overload status',
+            'units': '1',
+            'flag_values': numpy.array([0, 1], dtype=numpy.uint8),
+            'flag_meanings': 'not_overloaded overloaded',
+            'comment': (
+                'Active-high flag decoded from bit 15 of the channel header.'
             ),
         },
     }
@@ -73,7 +83,7 @@ class SPECFile(BinaryFile):
                                        ('data', '(2048, )u2'),
                                        ('discard', 'u2')
                                        ])
-        self.aux_channels = ['tas', 'clock_counts']
+        self.aux_channels = ['tas', 'clock_counts', 'overload_flag']
 
     def calc_buffer_datetimes(self):
         """ Calculates datetimes from bufffers read in from file and sets
@@ -164,10 +174,10 @@ class SPECFile(BinaryFile):
 
         pbar1 = tqdm(desc='Processing frames',
                      total=process_until - start,
-                     unit='frame')
+                     unit=' frame')
         pbar2 = tqdm(desc='Writing frames',
                      total=process_until - start,
-                     unit='frame')
+                     unit=' frame')
 
         t00 = time.time()
         i = 0
@@ -1256,6 +1266,7 @@ class SPECFile(BinaryFile):
                 images.buffer_index.append(frame)
                 images.tas.append(tas)
                 images.clock_counts.append(clock_counts)
+                images.overload_flag.append(p['overload'])
             p_img = None
             p_len = 0
 

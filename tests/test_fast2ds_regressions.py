@@ -73,6 +73,38 @@ class TestFast2DSRegressions(unittest.TestCase):
             int.from_bytes(bytes.fromhex('4C 4E'), byteorder='little'),
         )
 
+    def test_overload_flag_uses_active_channel_header_bit(self):
+        fast_2ds = self.make_file(1)
+        fast_2ds.data[0]['data'][:18] = [
+            fast_2ds.SYNC_2S,
+            0x8004,
+            0,
+            1,
+            1,
+            fast_2ds.RLE_FULL_SHADED,
+            100,
+            0,
+            0,
+            fast_2ds.SYNC_2S,
+            0,
+            4,
+            2,
+            1,
+            fast_2ds.RLE_FULL_SHADED,
+            200,
+            0,
+            0,
+        ]
+
+        for name, use_cython in self.implementations():
+            with self.subTest(implementation=name):
+                fast_2ds_module.HAS_CYTHON = use_cython
+                result = fast_2ds.process_frame_with_state(
+                    0, {'pending_h': {}, 'pending_v': {}}
+                )
+                self.assertEqual(result['h'][0]['overload_flag'], 1)
+                self.assertEqual(result['v'][0]['overload_flag'], 0)
+
     def test_split_header_and_oversized_packet_are_safe(self):
         split = self.make_file(2)
         split.data[0]['data'][2046:2048] = [split.SYNC_2S, 4]
@@ -164,12 +196,14 @@ class TestFast2DSRegressions(unittest.TestCase):
                 'buffer_index': 0,
                 'word_index': 20,
                 'data': pixels,
+                'overload_flag': 1,
             }],
             'v': [{
                 'time': 100,
                 'buffer_index': 0,
                 'word_index': 10,
                 'data': pixels,
+                'overload_flag': 0,
             }],
         })
 
@@ -179,6 +213,8 @@ class TestFast2DSRegressions(unittest.TestCase):
         self.assertEqual(v_images.ns, [0])
         self.assertEqual(h_images.timing_quality, [3])
         self.assertEqual(v_images.timing_quality, [3])
+        self.assertEqual(h_images.overload_flag, [1])
+        self.assertEqual(v_images.overload_flag, [0])
 
     def test_temperature_channels_are_preserved(self):
         fast_2ds = self.make_file(1)
@@ -212,7 +248,7 @@ class TestFast2DSRegressions(unittest.TestCase):
         particle_count = 22_500_000
         fast_2ds.data[0]['data'][:9] = [
             fast_2ds.SYNC_2S,
-            4,
+            0x8004,
             0,
             1,
             1,
@@ -295,6 +331,19 @@ class TestFast2DSRegressions(unittest.TestCase):
                     'hk_anchored_probe_counter '
                     'buffer_anchored_probe_counter '
                     'buffer_timestamp invalid_buffer_index',
+                )
+                overload = core['overload_flag']
+                self.assertEqual(overload.dtype, numpy.dtype('uint8'))
+                self.assertEqual(int(overload[0]), 1)
+                self.assertEqual(
+                    overload.long_name, 'Probe particle overload status'
+                )
+                self.assertEqual(overload.units, '1')
+                numpy.testing.assert_array_equal(
+                    overload.flag_values, [0, 1]
+                )
+                self.assertEqual(
+                    overload.flag_meanings, 'not_overloaded overloaded'
                 )
             finally:
                 output.close()

@@ -80,6 +80,7 @@ class Fast2DSFile(BinaryFile):
         'user_temp': 'f4',
         'ps_temp': 'f4',
         'timing_quality': 'u1',
+        'overload_flag': 'u1',
     }
     AUX_ATTRS = {
         'clock_counts': {
@@ -126,6 +127,15 @@ class Fast2DSFile(BinaryFile):
                 'invalid_buffer_index'
             ),
         },
+        'overload_flag': {
+            'long_name': 'Probe particle overload status',
+            'units': '1',
+            'flag_values': numpy.array([0, 1], dtype=numpy.uint8),
+            'flag_meanings': 'not_overloaded overloaded',
+            'comment': (
+                'Active-high flag decoded from bit 15 of the channel header.'
+            ),
+        },
     }
 
     # =========================================================================
@@ -167,6 +177,7 @@ class Fast2DSFile(BinaryFile):
             'user_temp',
             'ps_temp',
             'timing_quality',
+            'overload_flag',
         ]
 
     # =========================================================================
@@ -413,8 +424,8 @@ class Fast2DSFile(BinaryFile):
         chunksize = 500
         data_chunk = range(0, process_until)
 
-        pbar1 = tqdm(desc='Processing frames', total=process_until, unit='frame')
-        pbar2 = tqdm(desc='Writing frames', total=process_until, unit='frame')
+        pbar1 = tqdm(desc='Processing frames', total=process_until, unit=' frame')
+        pbar2 = tqdm(desc='Writing frames', total=process_until, unit=' frame')
 
         futures = []
         max_write_queue = 8
@@ -586,7 +597,9 @@ class Fast2DSFile(BinaryFile):
 
                 is_horiz = (nh > 0)
                 # Bit 12 (0x1000): multi-packet flag (1 = more packets follow, no timing words)
-                is_multi_packet = ((nh_raw if is_horiz else nv_raw) & 0x1000) >> 12
+                channel_header = nh_raw if is_horiz else nv_raw
+                is_multi_packet = (channel_header & 0x1000) >> 12
+                overload_flag = (channel_header & 0x8000) >> 15
 
                 data_start = idx + 5
                 data_end = data_start + n_words
@@ -702,6 +715,7 @@ class Fast2DSFile(BinaryFile):
                         'time': timing,
                         'data': final_data,
                         'buffer_index': frame,
+                        'overload_flag': overload_flag,
                     }
                     if is_horiz:
                         h_images.append(img_result)
@@ -1352,6 +1366,9 @@ class Fast2DSFile(BinaryFile):
                     imgs_obj.clock_counts.append(timings_list[i])
                     imgs_obj.timing_quality.append(
                         int(provisional_quality[i])
+                    )
+                    imgs_obj.overload_flag.append(
+                        int(img_dict.get('overload_flag', 0))
                     )
 
                     buf_idx = buf_indices_list[i]

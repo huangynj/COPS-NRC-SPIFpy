@@ -142,6 +142,7 @@ class TestSPECTiming(unittest.TestCase):
         images.buffer_index.append(0)
         images.tas.append(100.0)
         images.clock_counts.append((1 << 48) - 1)
+        images.overload_flag.append(1)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output = SPIFFile(os.path.join(temp_dir, 'spec.nc'), config)
@@ -152,6 +153,7 @@ class TestSPECTiming(unittest.TestCase):
                 core = output.instgrps['2DS-H']['core']
                 tas = core['tas']
                 counts = core['clock_counts']
+                overload = core['overload_flag']
 
                 self.assertEqual(
                     tas.long_name, 'True airspeed as recorded by probe'
@@ -169,8 +171,41 @@ class TestSPECTiming(unittest.TestCase):
                     'Free-running counter stored modulo 2^32 for 2DS and HVPS, '
                     'or modulo 2^48 for HVPS4.',
                 )
+                self.assertEqual(overload.dtype, numpy.dtype('uint8'))
+                self.assertEqual(int(overload[0]), 1)
+                self.assertEqual(
+                    overload.long_name, 'Probe particle overload status'
+                )
+                self.assertEqual(overload.units, '1')
+                numpy.testing.assert_array_equal(
+                    overload.flag_values, [0, 1]
+                )
+                self.assertEqual(
+                    overload.flag_meanings, 'not_overloaded overloaded'
+                )
             finally:
                 output.close()
+
+    def test_store_image_preserves_decoded_overload_flag(self):
+        self.spec.start_date = datetime.datetime(2024, 1, 1)
+        images = Images(self.spec.aux_channels)
+        flags = self.spec.decode_flags(1 << 15)
+        flags['timing'] = 0
+        flags['rem'] = 0
+
+        self.spec.store_image(
+            flags,
+            None,
+            numpy.ones(128, dtype=numpy.uint8),
+            0,
+            images,
+            self.spec.start_date,
+            0,
+            100.0,
+            123,
+        )
+
+        self.assertEqual(images.overload_flag, [1])
 
     def test_calc_image_times_writes_normalized_sec_and_ns(self):
         self.spec.start_date = datetime.datetime(2024, 1, 1)

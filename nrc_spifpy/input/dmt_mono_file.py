@@ -29,6 +29,34 @@ class DMTMonoFile(DMTBinaryFile):
         Name of current instrument, e.g., CIP, PIP.
     """
     syncword = numpy.array([170] * 8, dtype='B')
+    AUX_DTYPES = {
+        'image_count': 'u2',
+        'dof_flag': 'u1',
+    }
+    AUX_ATTRS = {
+        'image_count': {
+            'long_name': 'DMT particle image counter',
+            'units': '1',
+            'comment': (
+                '16-bit counter stored modulo 2^16; discontinuities can '
+                'indicate dropped particles.'
+            ),
+        },
+        'dof_flag': {
+            '_FillValue': numpy.uint8(255),
+            'long_name': 'DMT depth-of-field flag',
+            'units': '1',
+            'flag_values': numpy.array([0, 1], dtype=numpy.uint8),
+            'flag_meanings': (
+                'out_of_focus meets_depth_of_field_requirement'
+            ),
+            'description': (
+                'Active-high DMT probe flag: 1 indicates that the particle '
+                'meets the depth-of-field requirement for sizing; 0 indicates '
+                'rejection. Missing flags are stored as the fill value.'
+            ),
+        },
+    }
 
     def __init__(self, filename, inst_name, resolution):
         super().__init__(filename, inst_name, resolution)
