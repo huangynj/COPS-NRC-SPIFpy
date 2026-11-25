@@ -43,6 +43,9 @@ if HAS_CYTHON:
         )
     ]
     ext_modules_arg = cythonize(extensions)
+    # Fall back to the Python decoder if compilation fails (cythonize drops this flag).
+    for ext in ext_modules_arg:
+        ext.optional = True
 else:
     ext_modules_arg = []
 
